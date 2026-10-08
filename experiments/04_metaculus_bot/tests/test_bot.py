@@ -254,6 +254,14 @@ class ForecasterPipeline(unittest.TestCase):
         self.assertAlmostEqual(caught.exception.cost_usd, 0.05)
         self.assertIn("only 1/4 runs parsed", str(caught.exception))
 
+    def test_failure_reasons_are_summarised_in_the_error(self):
+        llm = self.LLM(["brief", RuntimeError("POST u → HTTP 429: upstream"), RuntimeError("POST u → HTTP 429: x"),
+                        "garbage", "Probability: 40%"])
+        config = {**PAID, "models": ["a", "b"], "runs_per_model": 2, "reasoning_effort": None}
+        with self.assertRaises(ForecastError) as caught:
+            Forecaster(llm, config, news=None, fetcher=None).forecast(self.POST)
+        self.assertIn("only 1/4 runs parsed (2× HTTP 429, 1× unparsable)", str(caught.exception))
+
 
 class ResolutionSources(unittest.TestCase):
     QUESTION = {"title": "Will Brent close above $100 on 30 Nov 2026?",
@@ -317,6 +325,61 @@ class Coverage(unittest.TestCase):
                 return posts[post_id]
 
         self.assertEqual(coverage(Client(), ["t"]), {"t": {"closed": 2, "missed": 1, "missed_posts": [2]}})
+
+class MetaculusPagination(unittest.TestCase):
+    """2026-10-08, bot-testing-area: /api/posts/ returns `next` on every page, even empty ones, and no `count`."""
+
+    def test_empty_page_with_next_ends_listing(self):
+        full = {"results": [{"id": i} for i in range(100)], "next": "https://x/?offset=100"}
+        empty = {"results": [], "next": "https://x/?offset=200"}
+        with mock.patch.object(clients, "_request", side_effect=[full, empty, empty, empty]) as request:
+            posts = clients.MetaculusClient(token="t").open_posts("bot-testing-area")
+        self.assertEqual(len(posts), 100)
+        self.assertEqual(request.call_count, 2)
+
+    def test_short_page_ends_listing_without_extra_call(self):
+        short = {"results": [{"id": 1}, {"id": 2}], "next": "https://x/?offset=100"}
+        with mock.patch.object(clients, "_request", side_effect=[short]) as request:
+            posts = clients.MetaculusClient(token="t").list_posts("bot-testing-area", "open")
+        self.assertEqual([p["id"] for p in posts], [1, 2])
+        self.assertEqual(request.call_count, 1)
+
+    def test_page_cap_guards_against_endless_full_pages(self):
+        full = {"results": [{"id": 0}] * 100, "next": "https://x/?offset=100"}
+        with mock.patch.object(clients, "_request", return_value=full) as request:
+            posts = clients.MetaculusClient(token="t").list_posts("bot-testing-area", "open", max_pages=3)
+        self.assertEqual(len(posts), 300)
+        self.assertEqual(request.call_count, 3)
+
+
+
+
+class RequestRetries(unittest.TestCase):
+    """429 handling in clients._request: backoff 5/10/20/40 s or the Retry-After header, then give up."""
+
+    @staticmethod
+    def _http_error(code, headers=None):
+        import email.message
+        import io
+        hdrs = email.message.Message()
+        for key, value in (headers or {}).items():
+            hdrs[key] = value
+        return clients.urllib.error.HTTPError("https://x", code, "err", hdrs, io.BytesIO(b'{"error": "x"}'))
+
+    def test_429_backs_off_then_succeeds(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b'{"a": 1}'
+        with mock.patch("urllib.request.urlopen", side_effect=[self._http_error(429), self._http_error(429), ok]), \
+                mock.patch("time.sleep") as sleep:
+            self.assertEqual(clients._request("https://x"), {"a": 1})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10])
+
+    def test_429_honours_retry_after_then_gives_up(self):
+        errors = [self._http_error(429, {"Retry-After": "3"}) for _ in range(5)]
+        with mock.patch("urllib.request.urlopen", side_effect=errors), mock.patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                clients._request("https://x")
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 3, 3, 3])
 
 
 if __name__ == "__main__":

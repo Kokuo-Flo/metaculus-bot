@@ -205,6 +205,20 @@ def aggregate_cdfs(by_model: dict[str, list[list[float]]]) -> list[float]:
     return pool([pool(cdfs) for cdfs in by_model.values() if cdfs])
 
 
+def failure_summary(texts: list[str]) -> str:
+    """'2× HTTP 429, 1× unparsable': why runs were lost, kept in the ledger error (the transcripts are not)."""
+    counts: dict[str, int] = {}
+    for text in texts:
+        if " failed] " not in text:
+            continue
+        reason = text.split(" failed] ", 1)[1]
+        match = re.search(r"HTTP (\d+)", reason)
+        key = f"HTTP {match.group(1)}" if match else ("empty answer" if "empty answer" in reason else "unparsable")
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join(f"{n}× {key}" for key, n in sorted(counts.items(), key=lambda item: (-item[1], item[0]))) \
+        or "no failed runs"
+
+
 class Forecaster:
     def __init__(self, llm, config: dict | None = None, news=None, fetcher=fetch):
         self.llm, self.news, self.fetcher = llm, news, fetcher
@@ -273,7 +287,7 @@ class Forecaster:
                     texts.append(f"[{model} failed] {str(error)[:300]}")
         parsed = sum(len(values) for values in by_model.values())
         if parsed < max(2, len(jobs) // 2):
-            raise RuntimeError(f"only {parsed}/{len(jobs)} runs parsed")
+            raise RuntimeError(f"only {parsed}/{len(jobs)} runs parsed ({failure_summary(texts)})")
         return by_model, texts, parsed, len(jobs)
 
     def forecast(self, post: dict) -> Forecast:

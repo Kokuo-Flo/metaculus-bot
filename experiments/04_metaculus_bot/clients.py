@@ -19,11 +19,23 @@ ASKNEWS_TOKEN_URL = "https://auth.asknews.app/oauth2/token"
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+RATE_LIMIT_WAITS = (5, 10, 20, 40)  # seconds between 429 retries without a Retry-After header: OpenRouter's free
+# models are "temporarily rate-limited upstream" for tens of seconds (two 5-10 s retries lost most runs, 2026-10-08)
+
+
+def _retry_after(error: urllib.error.HTTPError, default: int) -> int:
+    try:
+        return min(60, max(1, int(float(error.headers.get("Retry-After")))))
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
 def _request(url: str, method: str = "GET", headers: dict | None = None, body: object = None,
-             timeout: int = 180, retries: int = 3) -> dict:
+             timeout: int = 180, retries: int = 3, rate_limit_waits: tuple = RATE_LIMIT_WAITS) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     request_headers = {"Content-Type": "application/json", "User-Agent": "revenue-lab-bot/0.1", **(headers or {})}
-    for attempt in range(retries):
+    attempt = rate_limited = 0
+    while True:
         try:
             request = urllib.request.Request(url, data=data, method=method, headers=request_headers)
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -31,15 +43,20 @@ def _request(url: str, method: str = "GET", headers: dict | None = None, body: o
                 return json.loads(payload) if payload else {}
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
-            if error.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
+            if error.code == 429 and rate_limited < len(rate_limit_waits):
+                time.sleep(_retry_after(error, rate_limit_waits[rate_limited]))
+                rate_limited += 1
+                continue
+            if error.code in (500, 502, 503, 504) and attempt < retries - 1:
+                attempt += 1
+                time.sleep(5 * attempt)
                 continue
             raise RuntimeError(f"{method} {url} → HTTP {error.code}: {detail}") from error
         except urllib.error.URLError:
-            if attempt == retries - 1:
+            if attempt >= retries - 1:
                 raise
-            time.sleep(5 * (attempt + 1))
-    raise RuntimeError("unreachable")
+            attempt += 1
+            time.sleep(5 * attempt)
 
 
 # --- Metaculus ---
@@ -53,19 +70,24 @@ class MetaculusClient:
     def open_posts(self, tournament: int | str, limit: int = 100) -> list[dict]:
         return self.list_posts(tournament, "open", limit)
 
-    def list_posts(self, tournament: int | str, status: str, limit: int = 100) -> list[dict]:
-        """status: open | closed (awaiting resolution) | resolved."""
+    def list_posts(self, tournament: int | str, status: str, limit: int = 100, max_pages: int = 50) -> list[dict]:
+        """status: open | closed (awaiting resolution) | resolved.
+
+        Stops on a short or empty page, not on `next`: the API keeps sending `next` (and no `count`) past the last
+        page (bot-testing-area, 2026-10-08), so trusting `next` alone looped forever. `max_pages` is a last guard."""
         posts, offset = [], 0
-        while True:
+        for _ in range(max_pages):
             query = urllib.parse.urlencode({
                 "limit": limit, "offset": offset, "order_by": "-hotness", "statuses": status,
                 "forecast_type": "binary,multiple_choice,numeric,discrete", "tournaments": tournament,
                 "include_description": "true"})
             page = _request(f"{METACULUS_API}/posts/?{query}", headers=self.headers)
-            posts.extend(page.get("results", []))
-            if not page.get("next"):
+            results = page.get("results") or []
+            posts.extend(results)
+            if len(results) < limit or not page.get("next"):
                 return posts
             offset += limit
+        return posts
 
     def post(self, post_id: int) -> dict:
         return _request(f"{METACULUS_API}/posts/{post_id}/", headers=self.headers)

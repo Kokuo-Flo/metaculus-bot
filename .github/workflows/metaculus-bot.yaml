@@ -1,0 +1,51 @@
+# Free 24/7 runner for the bot alone (the laptop can stay off). Repo secrets: METACULUS_TOKEN, OPENROUTER_API_KEY,
+# and ASKNEWS_API_KEY (or ASKNEWS_CLIENT_ID + ASKNEWS_SECRET), free for participants.
+# Safety switch: scheduled runs only start once the repo variable BOT_LIVE is "true" (set it after a manual test run).
+# Optional repo variable BOT_PROFILE (free | cheap | full) forces one profile; unset = bot_config.json profile_chain.
+# State: Metaculus' `my_forecasts` tells the bot what is already done; the ledger (spend history, used by the 24 h cap
+# in budget.py) is carried from run to run through the Actions cache. The hard spend cap is still the OpenRouter key's
+# own credit limit: budget.py refuses a key without one.
+# A public repo has unlimited Actions minutes (and Metaculus doubles LLM credits for open-source bots);
+# a private repo's 2 000 free minutes/month will not cover a 20-minute schedule: switch to "7 * * * *".
+# Questions stay open ~1.5 h, so a run every 20 min catches each one; minutes 7/27/47 avoid the top-of-hour rush
+# that delays scheduled Actions (official template, PR #107).
+name: metaculus-bot
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+    - cron: "17 6 * * *"  # also checks coverage: questions that closed without our forecast in the last 7 days
+  workflow_dispatch:
+    inputs:
+      args: {description: "bot.py arguments for a manual run", default: "--mode test --dry-run"}
+concurrency: {group: metaculus-bot, cancel-in-progress: false}
+jobs:
+  forecast:
+    if: github.event_name == 'workflow_dispatch' || vars.BOT_LIVE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/cache/restore@v4
+        with: {path: state/ledger.sqlite, key: "ledger-${{ github.run_id }}", restore-keys: "ledger-"}
+      - run: python3 bot.py ${BOT_ARGS:---mode tournament} ${BOT_PROFILE:+--profile "$BOT_PROFILE"}
+        working-directory: experiments/04_metaculus_bot
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          BOT_PROFILE: ${{ vars.BOT_PROFILE }}
+          BOT_ARGS: ${{ inputs.args }}  # empty on scheduled runs → tournament
+          REVENUE_LAB_LEDGER: ${{ github.workspace }}/state/ledger.sqlite
+      - run: python3 score.py --coverage
+        if: github.event.schedule == '17 6 * * *'
+        working-directory: experiments/04_metaculus_bot
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          REVENUE_LAB_LEDGER: ${{ github.workspace }}/state/ledger.sqlite
+      - uses: actions/cache/save@v4
+        if: always()
+        with: {path: state/ledger.sqlite, key: "ledger-${{ github.run_id }}"}

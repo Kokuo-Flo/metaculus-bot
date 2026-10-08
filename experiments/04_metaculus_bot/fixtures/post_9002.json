@@ -1,0 +1,25 @@
+{
+ "id": 9002,
+ "question": {
+  "description": "Fixture question for offline pipeline tests.",
+  "fine_print": "",
+  "scheduled_close_time": "2026-11-01T00:00:00Z",
+  "scheduled_resolve_time": "2026-12-01T00:00:00Z",
+  "my_forecasts": {
+   "latest": null
+  },
+  "unit": null,
+  "id": 19002,
+  "type": "multiple_choice",
+  "title": "Which team will top the Ligue 1 table on 1 Dec 2026?",
+  "options": [
+   "PSG",
+   "Marseille",
+   "Monaco",
+   "Other"
+  ],
+  "resolution_criteria": "Table on ligue1.com.",
+  "resolution": "PSG"
+ },
+ "title": "Which team will top the Ligue 1 table on 1 Dec 2026?"
+}

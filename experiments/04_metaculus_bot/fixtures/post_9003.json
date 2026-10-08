@@ -1,0 +1,26 @@
+{
+ "id": 9003,
+ "question": {
+  "description": "Fixture question for offline pipeline tests.",
+  "fine_print": "",
+  "scheduled_close_time": "2026-11-01T00:00:00Z",
+  "scheduled_resolve_time": "2026-12-01T00:00:00Z",
+  "my_forecasts": {
+   "latest": null
+  },
+  "unit": "USD/bbl",
+  "id": 19003,
+  "type": "numeric",
+  "title": "What will the Brent spot price be on 30 Nov 2026 (USD/bbl)?",
+  "resolution_criteria": "EIA daily Brent spot (https://www.eia.gov/dnav/pet/hist/rbrteD.htm), as on FRED: https://fred.stlouisfed.org/series/DCOILBRENTEU.",
+  "scaling": {
+   "range_min": 40,
+   "range_max": 120,
+   "zero_point": null
+  },
+  "open_lower_bound": true,
+  "open_upper_bound": true,
+  "resolution": "71.4"
+ },
+ "title": "What will the Brent spot price be on 30 Nov 2026 (USD/bbl)?"
+}

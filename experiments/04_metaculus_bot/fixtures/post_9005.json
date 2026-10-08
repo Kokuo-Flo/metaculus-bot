@@ -1,0 +1,27 @@
+{
+ "id": 9005,
+ "question": {
+  "description": "Fixture question for offline pipeline tests.",
+  "fine_print": "",
+  "scheduled_close_time": "2026-11-01T00:00:00Z",
+  "scheduled_resolve_time": "2026-12-01T00:00:00Z",
+  "my_forecasts": {
+   "latest": null
+  },
+  "unit": "storms",
+  "id": 19005,
+  "type": "discrete",
+  "title": "How many named Atlantic storms form in November 2026?",
+  "resolution_criteria": "NHC.",
+  "scaling": {
+   "range_min": -0.5,
+   "range_max": 10.5,
+   "zero_point": null,
+   "inbound_outcome_count": 11
+  },
+  "open_lower_bound": false,
+  "open_upper_bound": true,
+  "resolution": "1"
+ },
+ "title": "How many named Atlantic storms form in November 2026?"
+}

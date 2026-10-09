@@ -4,6 +4,7 @@ the OpenRouter client, resolution sources and coverage.
 Run from experiments/04_metaculus_bot:  python3 -m unittest discover -s tests -p 'test_*.py'
 """
 import io
+import json
 import sqlite3
 import sys
 import tempfile
@@ -384,6 +385,16 @@ class RequestRetries(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 clients._request("https://x")
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 3, 3, 3])
+
+class ProductionTournaments(unittest.TestCase):
+    def test_only_verified_tournaments_run_in_production(self):
+        # Market Pulse 26Q4 and Animal Futures stay parked until their rules, a real submission and group posts
+        # are verified (see the comment on TOURNAMENTS); their pacing settings remain configured.
+        self.assertEqual(bot.TOURNAMENTS["tournament"], [33121, "minibench"])
+        config = json.loads((Path(__file__).resolve().parent.parent / "bot_config.json").read_text())
+        self.assertIn("market-pulse-26q4", config["tournaments"])
+        self.assertIn("33016", config["tournaments"])
+
 
 class ExitCode(unittest.TestCase):
     def test_red_only_when_nothing_worked(self):

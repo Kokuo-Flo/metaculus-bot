@@ -40,7 +40,11 @@ STRATEGY_ID = "metaculus-futureeval"
 # practice only). Ids/slugs follow forecasting-tools' MetaculusClient constants.
 TOURNAMENTS = {
     "test": ["bot-testing-area"],
-    "tournament": [33121, "minibench", "market-pulse-26q4", 33016],  # Fall FutureEval, MiniBench, Market Pulse 26Q4, Animal Futures
+    "tournament": [33121, "minibench"],  # Fall FutureEval 2026, rolling MiniBench
+    # Parked (pacing settings kept in bot_config.json): "market-pulse-26q4" and 33016 (Animal Futures). Re-enable
+    # only once (a) their rules are verified (scoring over the lifetime or at close? Animal Futures' "hold forecasts
+    # on >= 2 of 3 long-horizon questions"? the 26Q4 slug, via forecasting-tools' CURRENT_MARKET_PULSE_ID),
+    # (b) a real submission succeeded on bot-testing-area, and (c) group posts were exercised against the live API.
     "fixtures": ["fixtures"],
 }
 CONFIG = HERE / "bot_config.json"

@@ -24,7 +24,7 @@ from forecaster import (ForecastError, Forecaster, aggregate_binary, aggregate_o
                         parse_percentiles, parse_probability, resolve_config)
 from bot import combined_note, expand, needs_forecast  # noqa: E402
 from score import coverage  # noqa: E402
-from sources import _Text, excerpt, extract_urls, resolution_sources  # noqa: E402
+from sources import _Text, excerpt, extract_urls, html_to_text, resolution_sources  # noqa: E402
 
 PRICES = {  # USD per token / per request, OpenRouter format
     "paid/research": {"prompt": "0.000002", "completion": "0.000008", "request": "0", "web_search": "0.005"},
@@ -331,6 +331,34 @@ class ResolutionSources(unittest.TestCase):
         self.assertTrue(text.startswith("day 0 | 50.00"))
         self.assertNotIn("var x", text)
         self.assertIn("day 4999 | 99.99", excerpt(text, self.QUESTION["title"]))
+
+    def test_chrome_is_dropped_by_tag_class_and_role_and_lines_are_deduped(self):
+        html = ("<html><head><title>Oil report</title></head><body>"
+                "<div class='share-buttons'><a>Share</a><a>Facebook</a></div>"
+                "<div role='navigation'><div><span>Home</span></div><span>Contact</span></div>"
+                "<div class='site-menu'><ul><li>Sections</li><li><div>Deep</div></li></ul></div>"
+                "<div class='content'><h1>Brent report</h1><p>Brent closed at 112 USD on 29 Sep.</p>"
+                "<p>Brent closed at 112 USD on 29 Sep.</p><p>Share</p><p>Yes</p><p>Up 3</p>"
+                "<table><tr><td>Day</td><td>Price</td></tr><tr><td>30 Sep</td><td>113.2</td></tr></table></div>"
+                "<footer>Contact us | Privacy</footer></body></html>")
+        parser = _Text()
+        parser.feed(html)
+        self.assertEqual(parser.text().splitlines(), ["Oil report", "Brent report", "Brent closed at 112 USD on 29 Sep.",
+                                                       "Yes", "Up 3", "Day | Price", "30 Sep | 113.2"])
+
+    def test_malformed_chrome_block_falls_back_to_plain_parsing(self):
+        html = "<html><body><div class='menu'><p>Menu entry</p>" + "<p>Real content line number 42.</p>" * 3000
+        text = html_to_text(html)  # the unclosed menu div would swallow the whole page in aggressive mode
+        self.assertIn("Real content line number 42.", text)
+        article = ("<html><body><div class='nav'>Home Contact About</div><div class='article lg:pt-nav'>"
+                   + "".join(f"<p>Paragraph {i} of the article body.</p>" for i in range(40)) + "</div></body></html>")
+        text = html_to_text(article)  # a utility class that looks like chrome must not eat the article
+        self.assertIn("Paragraph 39 of the article body.", text)
+        page = ("<html><body><div class='nav'>Home Contact About</div><div>"
+                + "".join(f"<p>Body text {i}.</p>" for i in range(10)) + "</div></body></html>")
+        self.assertNotIn("Home Contact About", html_to_text(page))  # ordinary chrome share: the lean text wins
+        script = "<html><body><script>" + "x" * 60_000 + "</script><div id='app'>Loading --</div></body></html>"
+        self.assertIn("loaded by JavaScript", html_to_text(script))
 
     def test_prose_excerpt_prefers_relevant_lines_over_page_chrome(self):
         text = "\n".join(["Intro."] * 200 + ["Brent closed at 112 USD on 29 Sep."] + ["Categories: footer"] * 200)

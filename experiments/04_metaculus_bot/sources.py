@@ -21,36 +21,97 @@ STOPWORDS = {"will", "what", "when", "which", "with", "from", "that", "this", "t
              "more", "less", "least", "most", "there", "their", "have", "been", "according", "resolve", "question"}
 
 
+CHROME_CLASS = re.compile(r"\b(nav|navbar|menu|footer|sidebar|breadcrumbs?|cookie|consent|share|sharing|social|"
+                          r"subscribe|newsletter|related|recommended|promo|advert|ads|banner|toolbar|comments?|popup|"
+                          r"modal|skip-?link|login|signup|search-?form)\b", re.I)
+CHROME_ROLES = {"navigation", "banner", "contentinfo", "complementary", "search", "dialog", "menu", "menubar", "toolbar"}
+CONTAINERS = {"div", "section", "aside", "ul", "ol", "header", "footer", "nav", "form", "button", "select", "label",
+              "figure", "details"}  # tags whose class/role can mark a chrome block (void tags cannot contain text)
+CHROME_LABEL = re.compile(r"^(share|contact( us)?|menu|search|sign (in|up)|log ?(in|out)|subscribe|home|sections?|more|"
+                          r"close|skip to [a-z]+|cookies?|privacy|terms|follow( us)?|facebook|twitter|x \(twitter\)|"
+                          r"linkedin|reddit|email|print|open|next|previous|back|top|advertisement|loading)$", re.I)
+MIN_AGGRESSIVE_SHARE = 0.4  # below this share of the plain text, the class-based skipping ate an article: drop it
+
+
 class _Text(HTMLParser):
-    """Visible text, one line per block element; drops scripts, styles and page chrome."""
-    SKIPPED = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "iframe"}
+    """Visible text, one line per block element; drops scripts, styles and page chrome (by tag, and, when
+    `aggressive`, by class/id/role: menus, share buttons, cookie banners, related links...)."""
+    SKIPPED = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "iframe", "aside", "button",
+               "select", "template"}
     BLOCKS = {"p", "div", "tr", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6", "table", "section", "article"}
 
-    def __init__(self):
+    def __init__(self, aggressive: bool = True):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self.depth = 0
+        self.aggressive = aggressive
+        self.skip: list | None = None  # [tag, nesting] of the element being skipped, until its own end tag
+
+    def _chrome(self, tag: str, attrs) -> bool:
+        if tag in self.SKIPPED:
+            return True
+        if not self.aggressive or tag not in CONTAINERS:
+            return False
+        for name, value in attrs:
+            if not value:
+                continue
+            if name == "role" and value.strip().lower() in CHROME_ROLES:
+                return True
+            if name in ("class", "id", "aria-label") and CHROME_CLASS.search(value):
+                return True
+        return False
 
     def handle_starttag(self, tag, attrs):
-        if tag in self.SKIPPED:
-            self.depth += 1
+        if self.skip:
+            if tag == self.skip[0]:
+                self.skip[1] += 1
+            return
+        if self._chrome(tag, attrs):
+            self.skip = [tag, 1]
         elif tag in self.BLOCKS:
             self.parts.append("\n")
         elif tag in ("td", "th"):
             self.parts.append(" | ")
 
     def handle_endtag(self, tag):
-        if tag in self.SKIPPED and self.depth:
-            self.depth -= 1
+        if self.skip and tag == self.skip[0]:
+            self.skip[1] -= 1
+            if self.skip[1] == 0:
+                self.skip = None
+        elif not self.skip and tag in self.BLOCKS:
+            self.parts.append("\n")
 
     def handle_data(self, data):
-        if not self.depth:
+        if not self.skip:
             self.parts.append(data.replace("\n", " "))  # line breaks come from block tags only
 
     def text(self) -> str:
+        """Lines, each once; button labels (Share, Contact us, Sections...) are chrome."""
         lines = (re.sub(r"[ \t\xa0|]*\|[ \t\xa0|]*", " | ", re.sub(r"[ \t\xa0]+", " ", line)).strip(" |")
                  for line in "".join(self.parts).splitlines())
-        return "\n".join(line for line in lines if line)
+        out, seen = [], set()
+        for line in lines:
+            if not line:
+                continue
+            key = line.lower()
+            if key in seen or CHROME_LABEL.match(line):
+                continue
+            seen.add(key)
+            out.append(line)
+        return "\n".join(out)
+
+
+def html_to_text(body: str) -> str:
+    """Page text with chrome removed; falls back to plain tag skipping when the aggressive pass empties a malformed
+    page, and says so when a large page holds almost no text (data loaded by JavaScript is not in the HTML)."""
+    plain, aggressive = _Text(aggressive=False), _Text()
+    plain.feed(body)
+    aggressive.feed(body)
+    text, lean = plain.text(), aggressive.text()
+    if len(lean) >= MIN_AGGRESSIVE_SHARE * len(text):  # a utility class like "lg:pt-nav" must not eat an article
+        text = lean
+    if len(text) < 300 and len(body) > 50_000:
+        text += "\n[page body is mostly script: its data is probably loaded by JavaScript and is not in this HTML]"
+    return text
 
 
 def extract_urls(question: dict) -> list[str]:
@@ -76,9 +137,7 @@ def fetch(url: str, timeout: int = 15) -> str:
         lines = body.strip().splitlines()
         return "\n".join(lines[:1] + lines[-30:])
     if "html" in kind or body.lstrip()[:1] == "<":
-        parser = _Text()
-        parser.feed(body)
-        return parser.text()
+        return html_to_text(body)
     return body
 
 

@@ -100,6 +100,13 @@ def retry_comments(ledger: Ledger, metaculus) -> None:
             ledger.operation(STRATEGY_ID, "comment", False, post=row["post_id"], retry=True, error=str(error)[:300])
 
 
+def exit_code(done: int, failed: int, discovered: int) -> int:
+    """0 = the run did its job or had nothing to do; 1 = nothing worked (no tournament listed, or every question failed).
+    Partial failures stay green: the ledger and the daily coverage report carry them, and a red scheduled run every
+    20 min would only mail the repository owner."""
+    return 1 if discovered == 0 or (failed and not done) else 0
+
+
 class Cycle:
     """One run: shared state for the question loop (ledger writes and Metaculus posts stay on the main thread)."""
 
@@ -206,6 +213,7 @@ def main() -> int:
     if not args.dry_run:
         retry_comments(ledger, metaculus)
     posts: dict[int, tuple[object, dict]] = {}
+    discovered = 0
     for tournament in TOURNAMENTS[args.mode]:
         try:
             found = metaculus.open_posts(tournament)
@@ -214,6 +222,7 @@ def main() -> int:
             print(f"[discover] {tournament}: {error}", file=sys.stderr)
             continue
         ledger.operation(STRATEGY_ID, "discover", True, tournament=tournament, open_posts=len(found))
+        discovered += 1
         for post in found:
             if post.get("question"):  # group posts are not part of the bot tournaments' scored set
                 posts.setdefault(post["id"], (tournament, post))
@@ -274,7 +283,7 @@ def main() -> int:
           + (f" stop={cycle.stop}" if cycle.stop else ""))
     if offline:
         print(f"fixture submissions captured: {len(metaculus.submitted)}")
-    return 0 if cycle.failed == 0 else 1
+    return exit_code(cycle.done, cycle.failed, discovered)
 
 
 if __name__ == "__main__":

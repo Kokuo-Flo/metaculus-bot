@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import bot  # noqa: E402
 import clients  # noqa: E402
 from budget import Budget, BudgetExceeded, question_bound_usd, question_typical_usd  # noqa: E402
 from clients import KeyStatus, Meter, OpenRouter, strip_thinking  # noqa: E402
@@ -380,6 +381,13 @@ class RequestRetries(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 clients._request("https://x")
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 3, 3, 3])
+
+class ExitCode(unittest.TestCase):
+    def test_red_only_when_nothing_worked(self):
+        self.assertEqual(bot.exit_code(2, 3, 1), 0)  # partial failures: ledger + coverage report, not a red run
+        self.assertEqual(bot.exit_code(0, 0, 1), 0)  # nothing to do
+        self.assertEqual(bot.exit_code(0, 3, 1), 1)  # every question failed
+        self.assertEqual(bot.exit_code(0, 0, 0), 1)  # no tournament could be listed
 
 
 if __name__ == "__main__":

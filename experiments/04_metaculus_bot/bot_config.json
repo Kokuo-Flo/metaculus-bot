@@ -1,30 +1,83 @@
 {
-  "profile_chain": ["full", "standard", "cheap", "free"],
+  "profile_chain": [
+    "full",
+    "standard",
+    "cheap",
+    "free"
+  ],
   "profiles": {
     "full": {
-      "research_model": "openai/gpt-5.6-terra", "research_web": "native",
-      "models": ["openai/gpt-5.6-terra-pro", "anthropic/claude-opus-5.5"], "runs_per_model": 3,
-      "reasoning_effort": "high", "max_tokens": 20000
+      "research_model": "openai/gpt-5.6-terra",
+      "research_web": "native",
+      "models": [
+        "openai/gpt-5.6-terra-pro",
+        "anthropic/claude-opus-5.5"
+      ],
+      "runs_per_model": 3,
+      "reasoning_effort": "high",
+      "max_tokens": 20000
     },
     "standard": {
-      "research_model": "openai/gpt-5.6-terra", "research_web": "native",
-      "models": ["openai/gpt-5.6-terra", "anthropic/claude-sonnet-5.5"], "runs_per_model": 2
+      "research_model": "openai/gpt-5.6-terra",
+      "research_web": "native",
+      "models": [
+        "openai/gpt-5.6-terra",
+        "anthropic/claude-sonnet-5.5"
+      ],
+      "runs_per_model": 2
     },
     "cheap": {
-      "research_model": "openai/gpt-5.6-luna", "research_web": "native",
-      "models": ["openai/gpt-5.6-luna", "google/gemini-3.8-flash"], "runs_per_model": 2
+      "research_model": "openai/gpt-5.6-luna",
+      "research_web": "native",
+      "models": [
+        "openai/gpt-5.6-luna",
+        "google/gemini-3.8-flash"
+      ],
+      "runs_per_model": 2
     },
     "free": {
       "research_model": null,
-      "models": ["google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free"], "runs_per_model": 2
+      "models": [
+        "google/gemma-4-31b-it:free",
+        "google/gemma-4-26b-a4b-it:free"
+      ],
+      "runs_per_model": 2
     }
   },
   "tournaments": {
-    "33121": {"pace_share": 1.0},
-    "minibench": {"pace_share": 0.4}
+    "33121": {
+      "pace_share": 1.0,
+      "reforecast_days": null,
+      "note": "Fall FutureEval 2026: spot score at close, one forecast"
+    },
+    "minibench": {
+      "pace_share": 0.4,
+      "reforecast_days": null
+    },
+    "market-pulse-26q4": {
+      "pace_share": 0.25,
+      "reforecast_days": 7,
+      "note": "bots prize-eligible; lifetime scoring \u2192 weekly refresh"
+    },
+    "33016": {
+      "pace_share": 0.2,
+      "reforecast_days": 14,
+      "note": "Animal Futures: bots prize-eligible; long horizon, prizes 2027"
+    },
+    "bot-testing-area": {
+      "pace_share": 0.3,
+      "reforecast_days": null
+    },
+    "fixtures": {
+      "pace_share": 1.0,
+      "reforecast_days": 7
+    }
   },
   "asknews_articles": 8,
-  "binary_clamp": [0.015, 0.985],
+  "binary_clamp": [
+    0.015,
+    0.985
+  ],
   "mc_floor": 0.005,
   "extremize": 1.0,
   "max_tokens": 12000,

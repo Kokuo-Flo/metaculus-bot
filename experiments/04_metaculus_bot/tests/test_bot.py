@@ -18,6 +18,7 @@ from budget import Budget, BudgetExceeded, question_bound_usd, question_typical_
 from clients import KeyStatus, Meter, OpenRouter, strip_thinking  # noqa: E402
 from forecaster import (ForecastError, Forecaster, aggregate_binary, aggregate_options, parse_options,  # noqa: E402
                         parse_percentiles, parse_probability, resolve_config)
+from bot import combined_note, expand, needs_forecast  # noqa: E402
 from score import coverage  # noqa: E402
 from sources import _Text, excerpt, extract_urls, resolution_sources  # noqa: E402
 
@@ -388,6 +389,48 @@ class ExitCode(unittest.TestCase):
         self.assertEqual(bot.exit_code(0, 0, 1), 0)  # nothing to do
         self.assertEqual(bot.exit_code(0, 3, 1), 1)  # every question failed
         self.assertEqual(bot.exit_code(0, 0, 0), 1)  # no tournament could be listed
+
+
+class GroupsAndRefresh(unittest.TestCase):
+    GROUP = {"id": 7, "title": "Yield at month end?", "scheduled_close_time": "2026-12-31T00:00:00Z",
+             "group_of_questions": {"description": "D", "resolution_criteria": "R", "fine_print": "F", "questions": [
+                 {"id": 71, "type": "numeric", "label": "October", "title": "Yield at month end?",
+                  "scheduled_close_time": "2026-10-31T00:00:00Z", "my_forecasts": {"latest": None}},
+                 {"id": 72, "type": "numeric", "label": "", "my_forecasts": {"latest": None}}]}}
+
+    def test_group_post_unpacks_with_group_text_and_labels(self):
+        subs = expand(self.GROUP)
+        self.assertEqual([s["question"]["id"] for s in subs], [71, 72])
+        first = subs[0]["question"]
+        self.assertEqual((first["description"], first["resolution_criteria"], first["fine_print"]), ("D", "R", "F"))
+        self.assertEqual(first["title"], "Yield at month end? — October")
+        self.assertEqual(subs[1]["question"]["title"], "Yield at month end?")  # empty label, post title
+        self.assertEqual(expand({"id": 1, "question": {"id": 2}}), [{"id": 1, "question": {"id": 2}}])
+        self.assertEqual(expand({"id": 1, "notice": "no question"}), [])
+
+    def test_needs_forecast_one_shot_vs_periodic(self):
+        now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+        never = {"question": {"my_forecasts": {"latest": None}}}
+        recent = {"question": {"my_forecasts": {"latest": {"forecast_values": [0.5], "start_time": now.timestamp() - 86400}}}}
+        old = {"question": {"my_forecasts": {"latest": {"forecast_values": [0.5], "start_time": now.timestamp() - 8 * 86400}}}}
+        self.assertTrue(needs_forecast(never, None, now))
+        self.assertFalse(needs_forecast(recent, None, now))
+        self.assertFalse(needs_forecast(old, None, now))  # one-shot tournaments never refresh
+        self.assertFalse(needs_forecast(recent, 7, now))
+        self.assertTrue(needs_forecast(old, 7, now))
+
+    def test_combined_note_single_vs_group(self):
+        rows = [{"id": 1, "post_id": 7, "question_id": 71, "type": "numeric", "summary": "\"median≈3.1\"",
+                 "comment": "Automated forecast ... Aggregate: median≈3.1\n\n## Research\nstuff\n\n## Run 1\nlong"},
+                {"id": 2, "post_id": 7, "question_id": 72, "type": "numeric", "summary": "\"median≈3.3\"",
+                 "comment": "second"}]
+        self.assertEqual(combined_note(rows[:1]), rows[0]["comment"])
+        note = combined_note(rows)
+        self.assertIn("2 sub-questions", note)
+        self.assertIn("- q71 (numeric): median≈3.1", note)
+        self.assertIn("- q72 (numeric): median≈3.3", note)
+        self.assertIn("## Research\nstuff", note)
+        self.assertNotIn("## Run 1", note)
 
 
 if __name__ == "__main__":

@@ -3,13 +3,15 @@
 Usage:
   python3 bot.py --mode fixtures            # offline: fixture questions + fake LLM, nothing leaves the machine
   python3 bot.py --mode test [--dry-run]    # bot-testing-area tournament (needs METACULUS_TOKEN, OPENROUTER_API_KEY)
-  python3 bot.py --mode tournament          # Fall 2026 FutureEval (33121) + current MiniBench
+  python3 bot.py --mode tournament          # every tournament where bot accounts may win prizes (TOURNAMENTS)
   --profile full|standard|cheap|free        # force one profile; default: bot_config.json `profile_chain`
   --parallel N --time-budget S              # questions handled at once; stop taking new ones after S seconds
-Rules honoured (FutureEval): no human in the loop, one forecast per question, a reasoning comment with each
-forecast (retried on the next run if posting it failed: no comment, no prize), one bot per user.
-Scoring is the spot peer score at close and questions stay open ~1.5 h: coverage matters, re-forecasting does not,
-so the soonest-closing questions go first and several are forecast at once.
+Rules honoured (Metaculus): no human in the loop, one entry per competition (the bot account only), a reasoning
+note with each pass on a post (private, short, one per post per run; retried next run if posting failed: no comment,
+no prize), one bot per user.
+FutureEval/MiniBench score the last forecast at close and stay open ~1.5 h: coverage matters, re-forecasting does
+not. Market Pulse and Animal Futures score over the whole lifetime, so `tournaments.<id>.reforecast_days` refreshes
+those forecasts periodically. Group posts are unpacked into their sub-questions.
 Spend: only capped, prepaid credits, paced to last the season (see budget.py).
 """
 import argparse
@@ -34,9 +36,11 @@ from forecaster import ForecastError, Forecaster, resolve_config  # noqa: E402
 from sources import fetch  # noqa: E402
 
 STRATEGY_ID = "metaculus-futureeval"
+# Bot accounts are prize-eligible here (tournament rules checked 2026-10-09; everywhere else bots forecast for
+# practice only). Ids/slugs follow forecasting-tools' MetaculusClient constants.
 TOURNAMENTS = {
     "test": ["bot-testing-area"],
-    "tournament": [33121, "minibench"],  # fall-futureeval-2026, rolling MiniBench (template constants)
+    "tournament": [33121, "minibench", "market-pulse-26q4", 33016],  # Fall FutureEval, MiniBench, Market Pulse 26Q4, Animal Futures
     "fixtures": ["fixtures"],
 }
 CONFIG = HERE / "bot_config.json"
@@ -65,11 +69,53 @@ def init_store(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-def already_forecast(post: dict) -> bool:
+def expand(post: dict) -> list[dict]:
+    """A post as a list of forecastable (post, question) pairs: itself, or one pseudo-post per sub-question
+    of a group (the official client does the same: group-level text copied onto each sub-question)."""
+    if post.get("question"):
+        return [post]
+    group = post.get("group_of_questions")
+    if not group:
+        return []
+    pseudo_posts = []
+    for sub in group.get("questions") or []:
+        question = {**sub, "description": group.get("description") or "",
+                    "resolution_criteria": group.get("resolution_criteria") or "",
+                    "fine_print": group.get("fine_print") or ""}
+        label = (sub.get("label") or "").strip()
+        base = sub.get("title") or post.get("title") or ""
+        question["title"] = f"{base} — {label}" if label and label not in base else base
+        pseudo_posts.append({**post, "question": question, "group_label": label})
+    return pseudo_posts
+
+
+def last_forecast_time(question: dict) -> datetime | None:
+    """When our latest forecast on this question was made; None if there is none. A forecast whose timestamp
+    is missing counts as made long ago (so one-shot tournaments skip it and periodic ones refresh it)."""
     try:
-        return post["question"]["my_forecasts"]["latest"]["forecast_values"] is not None
+        latest = question["my_forecasts"]["latest"]
+        if latest["forecast_values"] is None:
+            return None
     except (KeyError, TypeError):
+        return None
+    try:
+        return datetime.fromtimestamp(float(latest["start_time"]), tz=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def already_forecast(post: dict) -> bool:
+    return last_forecast_time(post["question"]) is not None
+
+
+def needs_forecast(post: dict, reforecast_days: float | None, now: datetime | None = None) -> bool:
+    """One forecast per question by default; with `reforecast_days`, refresh once the last one is that old."""
+    last = last_forecast_time(post["question"])
+    if last is None:
+        return True
+    if not reforecast_days:
         return False
+    return (now or datetime.now(timezone.utc)) - last >= timedelta(days=reforecast_days)
 
 
 def close_time(post: dict) -> datetime | None:
@@ -87,23 +133,41 @@ def asknews_calls_this_month(ledger: Ledger) -> int:
         (STRATEGY_ID, month_start.isoformat())).fetchone()[0]
 
 
-def retry_comments(ledger: Ledger, metaculus) -> None:
+def combined_note(rows: list[sqlite3.Row]) -> str:
+    """One private note per post and run: the full reasoning for a single question, a digest for a group."""
+    if len(rows) == 1:
+        return rows[0]["comment"]
+    lines = [f"Automated forecasts on {len(rows)} sub-questions (same pipeline for each):"]
+    for row in rows:
+        summary = json.loads(row["summary"]) if row["summary"] else ""
+        lines.append(f"- q{row['question_id']} ({row['type']}): {summary}")
+    lines.append("\n" + rows[0]["comment"].split("\n\n## Run 1")[0][:2500])  # research digest of the first one
+    return "\n".join(lines)
+
+
+def post_notes(ledger: Ledger, metaculus) -> None:
+    """Post pending notes, grouped per post; mark their forecast rows as commented."""
     pending = ledger.connection.execute(
-        "SELECT id, post_id, comment FROM forecast WHERE submitted=1 AND commented=0").fetchall()
+        "SELECT id, post_id, question_id, type, summary, comment FROM forecast WHERE submitted=1 AND commented=0"
+        " ORDER BY post_id, id").fetchall()
+    by_post: dict[int, list[sqlite3.Row]] = {}
     for row in pending:
+        by_post.setdefault(row["post_id"], []).append(row)
+    for post_id, rows in by_post.items():
         try:
-            metaculus.comment(row["post_id"], row["comment"])
-            ledger.connection.execute("UPDATE forecast SET commented=1 WHERE id=?", (row["id"],))
+            metaculus.comment(post_id, combined_note(rows))
+            ledger.connection.execute(
+                f"UPDATE forecast SET commented=1 WHERE id IN ({','.join('?' * len(rows))})", [r["id"] for r in rows])
             ledger.connection.commit()
-            ledger.operation(STRATEGY_ID, "comment", True, post=row["post_id"], retry=True)
-        except Exception as error:
-            ledger.operation(STRATEGY_ID, "comment", False, post=row["post_id"], retry=True, error=str(error)[:300])
+            ledger.operation(STRATEGY_ID, "comment", True, post=post_id, forecasts=len(rows))
+        except Exception as error:  # forecasts are in: retry the note next run
+            ledger.operation(STRATEGY_ID, "comment", False, post=post_id, error=str(error)[:300])
 
 
 def exit_code(done: int, failed: int, discovered: int) -> int:
-    """0 = the run did its job or had nothing to do; 1 = nothing worked (no tournament listed, or every question failed).
-    Partial failures stay green: the ledger and the daily coverage report carry them, and a red scheduled run every
-    20 min would only mail the repository owner."""
+    """0 = the run did its job or had nothing to do; 1 = nothing worked (no tournament listed, or every question
+    failed). Partial failures stay green: the ledger and the daily coverage report carry them, and a red scheduled
+    run every 20 min would only mail the repository owner."""
     return 1 if discovered == 0 or (failed and not done) else 0
 
 
@@ -125,14 +189,15 @@ class Cycle:
 
     def finish(self, future: Future, tournament, post: dict, profile: str, started: float) -> None:
         duration = time.monotonic() - started
+        question_id = post["question"].get("id")
         try:
             forecast = future.result()
         except ForecastError as error:
             self.failed += 1
             self.book(post, profile, error.cost_usd, error.news_calls)
-            self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=post["question"].get("id"),
-                                  profile=profile, error=str(error)[:500])
-            print(f"[fail] post {post['id']} [{profile}]: {error}", file=sys.stderr)
+            self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=question_id, profile=profile,
+                                  error=str(error)[:500])
+            print(f"[fail] q{question_id} [{profile}]: {error}", file=sys.stderr)
             return
         self.book(post, profile, forecast.cost_usd, forecast.news_calls)
         try:
@@ -142,9 +207,9 @@ class Cycle:
             self.failed += 1
             self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=forecast.question_id,
                                   profile=profile, error=f"submit: {str(error)[:450]}")
-            print(f"[fail] post {post['id']} submit: {error}", file=sys.stderr)
+            print(f"[fail] q{question_id} submit: {error}", file=sys.stderr)
             return
-        cursor = self.ledger.connection.execute(
+        self.ledger.connection.execute(
             "INSERT INTO forecast (question_id, post_id, tournament, ts, type, payload, summary, cost_usd,"
             " submitted, profile, comment, commented)"
             " VALUES (?,?,?,strftime('%Y-%m-%dT%H:%M:%f','now'),?,?,?,?,?,?,?,?)",
@@ -152,17 +217,11 @@ class Cycle:
              json.dumps(forecast.payload), json.dumps(forecast.summary), forecast.cost_usd,
              int(not self.args.dry_run), profile, forecast.comment, None if self.args.dry_run else 0))
         self.ledger.connection.commit()
-        if not self.args.dry_run:
-            try:
-                self.metaculus.comment(forecast.post_id, forecast.comment)
-                self.ledger.connection.execute("UPDATE forecast SET commented=1 WHERE id=?", (cursor.lastrowid,))
-                self.ledger.connection.commit()
-            except Exception as error:  # forecast is in: keep it, retry the comment next run
-                self.ledger.operation(STRATEGY_ID, "comment", False, post=forecast.post_id, error=str(error)[:300])
         self.runs_ok, self.runs_total = self.runs_ok + forecast.runs_ok, self.runs_total + forecast.runs_total
         self.ledger.operation(STRATEGY_ID, "forecast", True, duration, question=forecast.question_id,
                               type=forecast.question_type, profile=profile, summary=forecast.summary,
-                              submitted=not self.args.dry_run, runs_parsed=f"{forecast.runs_ok}/{forecast.runs_total}",
+                              tournament=str(tournament), submitted=not self.args.dry_run,
+                              runs_parsed=f"{forecast.runs_ok}/{forecast.runs_total}",
                               cost_usd=round(forecast.cost_usd, 4))
         self.done += 1
         shown = "(hidden while open)" if self.hide_values else forecast.summary
@@ -192,7 +251,7 @@ def main() -> int:
     chain = [resolve_config(raw, name) for name in
              ([args.profile] if args.profile else raw.get("profile_chain") or [raw.get("profile")])]
     limits = chain[0]["budget"]
-    pace_shares = {str(key): value.get("pace_share", 1.0) for key, value in raw.get("tournaments", {}).items()}
+    tournament_settings = {str(key): value for key, value in raw.get("tournaments", {}).items()}
 
     metaculus = FixtureMetaculus() if offline else MetaculusClient()
     catalog = {} if offline else model_catalog()
@@ -211,7 +270,7 @@ def main() -> int:
 
     ledger.heartbeat(STRATEGY_ID)
     if not args.dry_run:
-        retry_comments(ledger, metaculus)
+        post_notes(ledger, metaculus)  # notes left over from a previous run
     posts: dict[int, tuple[object, dict]] = {}
     discovered = 0
     for tournament in TOURNAMENTS[args.mode]:
@@ -221,10 +280,10 @@ def main() -> int:
             ledger.operation(STRATEGY_ID, "discover", False, tournament=tournament, error=str(error)[:500])
             print(f"[discover] {tournament}: {error}", file=sys.stderr)
             continue
-        ledger.operation(STRATEGY_ID, "discover", True, tournament=tournament, open_posts=len(found))
         discovered += 1
+        ledger.operation(STRATEGY_ID, "discover", True, tournament=tournament, open_posts=len(found))
         for post in found:
-            if post.get("question"):  # group posts are not part of the bot tournaments' scored set
+            if post.get("question") or post.get("group_of_questions"):
                 posts.setdefault(post["id"], (tournament, post))
     far = datetime.max.replace(tzinfo=timezone.utc)
     queue = sorted(posts.values(), key=lambda item: close_time(item[1]) or far)  # soonest window first
@@ -241,37 +300,48 @@ def main() -> int:
             cycle.finish(future, *running.pop(future))
 
     for tournament, summary_post in queue:
-        reap(block=False)
-        if cycle.done + cycle.failed + len(running) >= args.max_questions:
+        if cycle.stop:
             break
-        if time.monotonic() - run_started > args.time_budget:
-            cycle.stop = f"time budget of {args.time_budget}s reached; the next run continues"
-            break
-        closes = close_time(summary_post)
-        if closes and closes - datetime.now(timezone.utc) < MIN_TIME_TO_CLOSE:
-            cycle.skipped += 1
-            continue
-        post = metaculus.post(summary_post["id"])
-        if already_forecast(post):
-            cycle.skipped += 1
-            continue
-        while len(running) >= max(1, args.parallel):
-            reap(block=True)
-        try:
-            config, _, skipped_profiles = budget.choose(chain, pace_shares.get(str(tournament), 1.0)) if budget \
-                else (chain[0], 0.0, "")
-        except BudgetExceeded as error:
-            cycle.stop = str(error)
-            ledger.operation(STRATEGY_ID, "budget", False, error=cycle.stop)
-            print(f"[budget] stopping: {cycle.stop}", file=sys.stderr)
-            break
-        if skipped_profiles:
-            print(f"[budget] post {post['id']} → {config['profile']} ({skipped_profiles})")
-        future = executor.submit(forecasters[config["profile"]].forecast, post)
-        running[future] = (tournament, post, config["profile"], time.monotonic())
+        settings = tournament_settings.get(str(tournament), {})
+        detail = None
+        for post in expand(summary_post):
+            reap(block=False)
+            if cycle.done + cycle.failed + len(running) >= args.max_questions:
+                cycle.stop = f"max-questions {args.max_questions} reached; the next run continues"
+                break
+            if time.monotonic() - run_started > args.time_budget:
+                cycle.stop = f"time budget of {args.time_budget}s reached; the next run continues"
+                break
+            closes = close_time(post)
+            if closes and closes - datetime.now(timezone.utc) < MIN_TIME_TO_CLOSE:
+                cycle.skipped += 1
+                continue
+            if detail is None:
+                detail = metaculus.post(summary_post["id"])  # fresh my_forecasts; one fetch per post
+            fresh = [p for p in expand(detail) if p["question"].get("id") == post["question"].get("id")]
+            post = fresh[0] if fresh else post
+            if not needs_forecast(post, settings.get("reforecast_days")):
+                cycle.skipped += 1
+                continue
+            while len(running) >= max(1, args.parallel):
+                reap(block=True)
+            try:
+                config, _, skipped_profiles = budget.choose(chain, settings.get("pace_share", 1.0)) if budget \
+                    else (chain[0], 0.0, "")
+            except BudgetExceeded as error:
+                cycle.stop = str(error)
+                ledger.operation(STRATEGY_ID, "budget", False, error=cycle.stop)
+                print(f"[budget] stopping: {cycle.stop}", file=sys.stderr)
+                break
+            if skipped_profiles:
+                print(f"[budget] q{post['question'].get('id')} → {config['profile']} ({skipped_profiles})")
+            future = executor.submit(forecasters[config["profile"]].forecast, post)
+            running[future] = (tournament, post, config["profile"], time.monotonic())
     while running:
         reap(block=True)
     executor.shutdown(wait=True)
+    if not args.dry_run:
+        post_notes(ledger, metaculus)
 
     parse_rate = f"{cycle.runs_ok}/{cycle.runs_total}" if cycle.runs_total else "n/a"
     ledger.operation(STRATEGY_ID, "cycle", cycle.failed == 0 and not cycle.stop, mode=args.mode, done=cycle.done,

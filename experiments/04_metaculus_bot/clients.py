@@ -79,7 +79,8 @@ class MetaculusClient:
         for _ in range(max_pages):
             query = urllib.parse.urlencode({
                 "limit": limit, "offset": offset, "order_by": "-hotness", "statuses": status,
-                "forecast_type": "binary,multiple_choice,numeric,discrete", "tournaments": tournament,
+                "forecast_type": "binary,multiple_choice,numeric,discrete,group_of_questions",
+                "tournaments": tournament,
                 "include_description": "true"})
             page = _request(f"{METACULUS_API}/posts/?{query}", headers=self.headers)
             results = page.get("results") or []

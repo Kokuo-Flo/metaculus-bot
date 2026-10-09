@@ -1,0 +1,40 @@
+{
+ "id": 9006,
+ "title": "What will the 10-year OAT yield be at the end of each month?",
+ "scheduled_close_time": "2026-12-31T00:00:00Z",
+ "group_of_questions": {
+  "description": "Fixture group question (Market Pulse style): one sub-question per month.",
+  "resolution_criteria": "Resolves to the Banque de France end-of-month 10-year OAT yield.",
+  "fine_print": "",
+  "questions": [
+   {
+    "id": 19006,
+    "type": "numeric",
+    "label": "October 2026",
+    "title": "What will the 10-year OAT yield be at the end of each month?",
+    "scheduled_close_time": "2026-10-31T00:00:00Z",
+    "scheduled_resolve_time": "2026-11-02T00:00:00Z",
+    "unit": "%",
+    "scaling": {"range_min": 2.0, "range_max": 5.0, "zero_point": null},
+    "open_lower_bound": true,
+    "open_upper_bound": true,
+    "my_forecasts": {"latest": {"forecast_values": [0.1, 0.9], "start_time": 1759000000}},
+    "resolution": null
+   },
+   {
+    "id": 19007,
+    "type": "numeric",
+    "label": "November 2026",
+    "title": "What will the 10-year OAT yield be at the end of each month?",
+    "scheduled_close_time": "2026-11-30T00:00:00Z",
+    "scheduled_resolve_time": "2026-12-02T00:00:00Z",
+    "unit": "%",
+    "scaling": {"range_min": 2.0, "range_max": 5.0, "zero_point": null},
+    "open_lower_bound": true,
+    "open_upper_bound": true,
+    "my_forecasts": {"latest": null},
+    "resolution": null
+   }
+  ]
+ }
+}

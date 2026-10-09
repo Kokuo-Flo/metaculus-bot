@@ -23,6 +23,7 @@ from clients import KeyStatus, Meter, OpenRouter, strip_thinking  # noqa: E402
 from forecaster import (ForecastError, Forecaster, aggregate_binary, aggregate_options, parse_options,  # noqa: E402
                         parse_percentiles, parse_probability, resolve_config)
 from bot import combined_note, expand, needs_forecast  # noqa: E402
+from replay import latest_batches, replay, rules  # noqa: E402
 from score import coverage  # noqa: E402
 from sources import _Text, excerpt, extract_urls, html_to_text, resolution_sources  # noqa: E402
 
@@ -635,6 +636,70 @@ class FaultInjection(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("done=0 failed=0", out)
         self.assertIn("stop=time budget of 0s reached", out)
+
+
+class Replay(unittest.TestCase):
+    """Offline re-aggregation of stored runs on resolved questions."""
+
+    BINARY = {"id": 1, "type": "binary", "resolution": "yes"}
+    MC = {"id": 2, "type": "multiple_choice", "options": ["A", "B"], "resolution": "A"}
+    NUMERIC = {"id": 3, "type": "numeric", "resolution": "42",
+               "scaling": {"range_min": 0, "range_max": 100, "zero_point": None},
+               "open_lower_bound": False, "open_upper_bound": False}
+
+    class Metaculus:
+        def __init__(self, questions):
+            self.questions = {q["id"]: q for q in questions}
+
+        def post(self, post_id):  # post 10x holds question x; post 200 is a group of 1 and 2
+            if post_id == 200:
+                return {"id": 200, "group_of_questions": {"questions": [self.questions[1], self.questions[2]]}}
+            return {"id": post_id, "question": self.questions[post_id - 100]}
+
+    def ledger(self, rows):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        bot.init_store(connection)
+        connection.executemany(
+            "INSERT INTO run (ts, question_id, post_id, model, ok, value) VALUES (?,?,?,?,1,?)",
+            [(ts, q, p, m, json.dumps(v)) for ts, q, p, m, v in rows])
+        return connection
+
+    def test_latest_batch_per_question(self):
+        connection = self.ledger([("2026-10-01T10:00:00.000", 1, 101, "a", 0.2), ("2026-10-01T10:00:00.400", 1, 101, "b", 0.3),
+                                  ("2026-10-02T10:00:00.000", 1, 101, "a", 0.6), ("2026-10-02T10:00:01.000", 1, 101, "b", 0.7)])
+        self.assertEqual(latest_batches(connection)[1]["by_model"], {"a": [0.6], "b": [0.7]})
+
+    def test_rules_cover_each_type_and_current_matches_production(self):
+        by_model = {"a": [0.2, 0.3, 0.25], "b": [0.5, 0.4]}
+        out = rules("binary", by_model, {"binary_clamp": [0.01, 0.99]})
+        self.assertAlmostEqual(out["current"]["probability_yes"], aggregate_binary(by_model, (0.01, 0.99)))
+        self.assertGreater(out["current"]["probability_yes"], out["extremize_1.6"]["probability_yes"])  # below 50 %: pushed down
+        self.assertEqual(set(out) >= {"current", "mean_all", "median_all", "only:a", "only:b"}, True)
+        mc = rules("multiple_choice", {"a": [{"A": 0.7, "B": 0.3}], "b": [{"A": 0.5, "B": 0.5}]}, {}, ["A", "B"])
+        self.assertAlmostEqual(mc["current"]["probability_yes_per_category"]["A"], 0.6)
+        cdf = [i / 200 for i in range(201)]
+        num = rules("numeric", {"a": [cdf], "b": [cdf]}, {})
+        self.assertEqual(num["pool_all"]["continuous_cdf"][100], 0.5)
+
+    def test_replay_scores_resolved_questions_and_ranks_rules(self):
+        from cdf import Scale, percentiles_to_cdf
+        scale = Scale(0, 100, None, False, False)
+        narrow = percentiles_to_cdf({10: 38, 20: 39, 40: 41, 60: 43, 80: 45, 90: 46}, scale, 201)
+        wide = percentiles_to_cdf({10: 10, 20: 20, 40: 35, 60: 50, 80: 70, 90: 85}, scale, 201)
+        rows = [("2026-10-01T10:00:00.000", 1, 200, "a", 0.8), ("2026-10-01T10:00:00.100", 1, 200, "b", 0.6),
+                ("2026-10-01T10:00:00.000", 2, 200, "a", {"A": 0.7, "B": 0.3}), ("2026-10-01T10:00:00.100", 2, 200, "b", {"A": 0.4, "B": 0.6}),
+                ("2026-10-01T10:00:00.000", 3, 103, "a", narrow), ("2026-10-01T10:00:00.100", 3, 103, "b", wide),
+                ("2026-10-01T10:00:00.000", 4, 104, "a", 0.5)]  # question 4 unresolved
+        questions = [self.BINARY, self.MC, self.NUMERIC, {"id": 4, "type": "binary", "resolution": None}]
+        report = replay(self.ledger(rows), self.Metaculus(questions), {"binary_clamp": [0.01, 0.99], "mc_floor": 0.005})
+        self.assertEqual((report["resolved"], report["unresolved"], report["reliable"]), (3, 1, False))
+        table = report["rules"]
+        self.assertEqual(table["current"]["n"], 3)
+        self.assertEqual(table["only:a"]["n"], 3)
+        self.assertGreater(table["only:a"]["mean_skill"], table["current"]["mean_skill"])  # model a was right every time
+        self.assertEqual(table["only:a"]["wins_vs_current"], 3)
+        self.assertEqual(table["extremize_1.6"]["n"], 1)  # binary only
 
 
 if __name__ == "__main__":

@@ -3,8 +3,10 @@ the OpenRouter client, resolution sources and coverage.
 
 Run from experiments/04_metaculus_bot:  python3 -m unittest discover -s tests -p 'test_*.py'
 """
+import io
 import sqlite3
 import sys
+import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -431,6 +433,29 @@ class GroupsAndRefresh(unittest.TestCase):
         self.assertIn("- q72 (numeric): median≈3.3", note)
         self.assertIn("## Research\nstuff", note)
         self.assertNotIn("## Run 1", note)
+
+
+class LoopResilience(unittest.TestCase):
+    def test_refused_post_is_logged_and_the_run_goes_on(self):
+        original = bot.FixtureMetaculus.post
+
+        def flaky(self, post_id):
+            if post_id == 9002:
+                raise RuntimeError("GET /posts/9002/ → HTTP 404: not found")
+            return original(self, post_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = Path(tmp) / "ledger.sqlite"
+            with mock.patch.object(bot.FixtureMetaculus, "post", flaky), \
+                    mock.patch.object(sys, "argv", ["bot.py", "--mode", "fixtures", "--ledger", str(ledger_path)]), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                code = bot.main()
+            self.assertEqual(code, 0)  # the other posts went through
+            self.assertIn("[fail] post 9002 fetch: GET /posts/9002/", err.getvalue())
+            connection = sqlite3.connect(ledger_path)
+            self.assertEqual(connection.execute("SELECT ok FROM operation WHERE kind='post'").fetchall(), [(0,)])
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM forecast WHERE submitted=1").fetchone()[0], 6)
 
 
 if __name__ == "__main__":

@@ -317,7 +317,13 @@ def main() -> int:
                 cycle.skipped += 1
                 continue
             if detail is None:
-                detail = metaculus.post(summary_post["id"])  # fresh my_forecasts; one fetch per post
+                try:
+                    detail = metaculus.post(summary_post["id"])  # fresh my_forecasts; one fetch per post
+                except Exception as error:  # one refused post must not end the run: it would, on every run
+                    cycle.failed += 1
+                    ledger.operation(STRATEGY_ID, "post", False, post=summary_post["id"], error=str(error)[:300])
+                    print(f"[fail] post {summary_post['id']} fetch: {error}", file=sys.stderr)
+                    break
             fresh = [p for p in expand(detail) if p["question"].get("id") == post["question"].get("id")]
             post = fresh[0] if fresh else post
             if not needs_forecast(post, settings.get("reforecast_days")):
@@ -330,6 +336,11 @@ def main() -> int:
                     else (chain[0], 0.0, "")
             except BudgetExceeded as error:
                 cycle.stop = str(error)
+                ledger.operation(STRATEGY_ID, "budget", False, error=cycle.stop)
+                print(f"[budget] stopping: {cycle.stop}", file=sys.stderr)
+                break
+            except Exception as error:  # key status or prices unreachable: stop cleanly, the next run retries
+                cycle.stop = f"budget check failed: {str(error)[:200]}"
                 ledger.operation(STRATEGY_ID, "budget", False, error=cycle.stop)
                 print(f"[budget] stopping: {cycle.stop}", file=sys.stderr)
                 break

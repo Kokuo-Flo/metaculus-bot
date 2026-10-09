@@ -49,6 +49,8 @@ TOURNAMENTS = {
 }
 CONFIG = HERE / "bot_config.json"
 MIN_TIME_TO_CLOSE = timedelta(minutes=5)  # a forecast that cannot land before close only costs money
+SUPPORTED_TYPES = ("binary", "multiple_choice", "numeric", "discrete")  # the listing filters on these, but a
+# group may hold other kinds (a `date` sub-question exists in bot-testing-area): skip them, do not fail them
 
 
 def load_dotenv(path: Path) -> None:
@@ -319,6 +321,11 @@ def main() -> int:
             closes = close_time(post)
             if closes and closes - datetime.now(timezone.utc) < MIN_TIME_TO_CLOSE:
                 cycle.skipped += 1
+                continue
+            if post["question"].get("type") not in SUPPORTED_TYPES:
+                cycle.skipped += 1
+                ledger.operation(STRATEGY_ID, "skip", True, question=post["question"].get("id"),
+                                 reason=f"unsupported type {post['question'].get('type')}")
                 continue
             if detail is None:
                 try:

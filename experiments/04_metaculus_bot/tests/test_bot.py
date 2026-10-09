@@ -3,6 +3,7 @@ the OpenRouter client, resolution sources and coverage.
 
 Run from experiments/04_metaculus_bot:  python3 -m unittest discover -s tests -p 'test_*.py'
 """
+import contextlib
 import io
 import json
 import sqlite3
@@ -467,6 +468,93 @@ class LoopResilience(unittest.TestCase):
             connection = sqlite3.connect(ledger_path)
             self.assertEqual(connection.execute("SELECT ok FROM operation WHERE kind='post'").fetchall(), [(0,)])
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM forecast WHERE submitted=1").fetchone()[0], 6)
+
+
+class FaultInjection(unittest.TestCase):
+    """Whole runs on the fixtures with one thing broken at a time: the run must degrade, never die."""
+
+    DATE_POST = {"id": 9999, "title": "When?", "scheduled_close_time": "2027-06-01T00:00:00Z",
+                 "question": {"id": 19999, "type": "date", "title": "When?", "my_forecasts": {"latest": None}}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ledger_path = Path(self.tmp.name) / "ledger.sqlite"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_bot(self, *extra_args, patches=()):
+        argv = ["bot.py", "--mode", "fixtures", "--ledger", str(self.ledger_path), *extra_args]
+        with contextlib.ExitStack() as stack:
+            for target, attribute, value in patches:
+                stack.enter_context(mock.patch.object(target, attribute, value))
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            out = stack.enter_context(mock.patch("sys.stdout", new_callable=io.StringIO))
+            err = stack.enter_context(mock.patch("sys.stderr", new_callable=io.StringIO))
+            code = bot.main()
+        return code, out.getvalue(), err.getvalue(), sqlite3.connect(self.ledger_path)
+
+    def test_unsupported_question_type_is_skipped_not_failed(self):
+        original_open, original_post = bot.FixtureMetaculus.open_posts, bot.FixtureMetaculus.post
+
+        def open_posts(self_, tournament, limit=100):
+            return original_open(self_, tournament, limit) + [FaultInjection.DATE_POST]
+
+        def post(self_, post_id):
+            return FaultInjection.DATE_POST if post_id == 9999 else original_post(self_, post_id)
+
+        code, out, err, db = self.run_bot(patches=[(bot.FixtureMetaculus, "open_posts", open_posts),
+                                                   (bot.FixtureMetaculus, "post", post)])
+        self.assertEqual(code, 0)
+        self.assertIn("done=7 failed=0 skipped=1", out)
+        self.assertEqual(db.execute("SELECT detail FROM operation WHERE kind='skip'").fetchone()[0].count("date"), 1)
+
+    def test_refused_submission_is_a_failed_question_not_a_dead_run(self):
+        def forecast(self_, question_id, payload):
+            if question_id == 19001:
+                raise RuntimeError("POST /questions/forecast/ → HTTP 400: bad payload")
+            self_.submitted.append((question_id, payload))
+
+        code, out, err, db = self.run_bot(patches=[(bot.FixtureMetaculus, "forecast", forecast)])
+        self.assertEqual(code, 0)
+        self.assertIn("done=6 failed=1", out)
+        self.assertIn("[fail] q19001 submit: POST /questions/forecast/", err)
+        error = db.execute("SELECT detail FROM operation WHERE kind='forecast' AND ok=0").fetchone()[0]
+        self.assertIn('"error": "submit: POST', error)
+
+    def test_failed_note_is_retried_on_the_next_run(self):
+        def comment(self_, post_id, text):
+            raise RuntimeError("POST /comments/create/ → HTTP 500")
+
+        code, out, err, db = self.run_bot(patches=[(bot.FixtureMetaculus, "comment", comment)])
+        self.assertEqual(code, 0)  # forecasts are in; only the notes are missing
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM forecast WHERE submitted=1 AND commented=0").fetchone()[0], 7)
+        self.assertGreaterEqual(db.execute("SELECT COUNT(*) FROM operation WHERE kind='comment' AND ok=0").fetchone()[0], 1)
+        db.close()
+        code, out, err, db = self.run_bot()  # notes work again: leftovers go out first
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM forecast WHERE submitted=1 AND commented=0").fetchone()[0], 0)
+        self.assertGreaterEqual(db.execute("SELECT COUNT(*) FROM operation WHERE kind='comment' AND ok=1").fetchone()[0], 6)
+
+    def test_one_broken_tournament_does_not_stop_the_others(self):
+        original = bot.FixtureMetaculus.open_posts
+
+        def open_posts(self_, tournament, limit=100):
+            if tournament == "broken":
+                raise RuntimeError("GET /posts/ → HTTP 503")
+            return original(self_, tournament, limit)
+
+        with mock.patch.dict(bot.TOURNAMENTS, {"fixtures": ["broken", "fixtures"]}):
+            code, out, err, db = self.run_bot(patches=[(bot.FixtureMetaculus, "open_posts", open_posts)])
+        self.assertEqual(code, 0)
+        self.assertIn("[discover] broken: GET /posts/", err)
+        self.assertIn("done=7 failed=0", out)
+        self.assertEqual([row[0] for row in db.execute("SELECT ok FROM operation WHERE kind='discover' ORDER BY id")], [0, 1])
+
+    def test_zero_time_budget_stops_cleanly_before_any_question(self):
+        code, out, err, db = self.run_bot("--time-budget", "0")
+        self.assertEqual(code, 0)
+        self.assertIn("done=0 failed=0", out)
+        self.assertIn("stop=time budget of 0s reached", out)
 
 
 if __name__ == "__main__":

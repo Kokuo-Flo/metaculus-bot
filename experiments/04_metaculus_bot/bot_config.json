@@ -41,7 +41,8 @@
         "google/gemma-4-31b-it:free",
         "google/gemma-4-26b-a4b-it:free"
       ],
-      "runs_per_model": 2
+      "runs_per_model": 2,
+      "reformat_model": null
     }
   },
   "tournaments": {
@@ -57,7 +58,7 @@
     "market-pulse-26q4": {
       "pace_share": 0.25,
       "reforecast_days": 7,
-      "note": "bots prize-eligible; lifetime scoring \u2192 weekly refresh"
+      "note": "bots prize-eligible; lifetime scoring → weekly refresh"
     },
     "33016": {
       "pace_share": 0.2,
@@ -90,5 +91,6 @@
     "allow_uncapped_key": false,
     "season_end": "2026-12-20",
     "asknews_calls_per_month": 900
-  }
+  },
+  "reformat_model": "google/gemini-3.8-flash"
 }

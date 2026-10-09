@@ -13,6 +13,7 @@ import json
 import math
 import re
 import statistics
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
@@ -94,6 +95,15 @@ Options (exact labels) — OPTIONS_JSON: {options_json}
 Leave some probability on every option. End with one line per option, in order, formatted
 "<option label>: XX%" (Option_A: XX% style), summing to 100%."""
 
+REFORMAT_PROMPT = """Below is a forecaster's answer that did not end in the required format. Extract the forecaster's
+own final answer and output ONLY the required lines, nothing else. Do not invent numbers: if the answer gives no
+final numbers, output exactly NONE.
+Required format:{format_spec}
+
+Forecaster's answer:
+{answer}"""
+REFORMAT_CHARS, REFORMAT_MAX_TOKENS = 6_000, 600  # the tail of the answer holds the conclusion; the reply is tiny
+
 NUMERIC_TAIL = """
 Units: {unit}. {bounds_text}
 BOUNDS_JSON: {lower} {upper}
@@ -121,14 +131,24 @@ class Forecast:
     runs: list[str] = field(default_factory=list)
     runs_ok: int = 0
     runs_total: int = 0
+    research: dict = field(default_factory=dict)  # {"sources": bool, "news": bool, "brief": bool}: what the prompt had
+    run_records: list[dict] = field(default_factory=list)  # one per model run: ok, value, cost, tokens, reformatted
 
 
 class ForecastError(RuntimeError):
-    """A failed question still consumed credits and news calls: the caller books them."""
+    """A failed question still consumed credits and news calls: the caller books them (and keeps the run records)."""
 
-    def __init__(self, message: str, cost_usd: float = 0.0, news_calls: int = 0):
+    def __init__(self, message: str, cost_usd: float = 0.0, news_calls: int = 0, runs: list[dict] | None = None,
+                 research: dict | None = None):
         super().__init__(message)
         self.cost_usd, self.news_calls = cost_usd, news_calls
+        self.runs, self.research = runs or [], research or {}
+
+
+class EnsembleError(RuntimeError):
+    def __init__(self, message: str, runs: list[dict]):
+        super().__init__(message)
+        self.runs = runs
 
 
 # --- parsing ---
@@ -228,8 +248,9 @@ class Forecaster:
         return self.llm.complete(model, prompt, max_tokens=self.config["max_tokens"],
                                  reasoning=self.config["reasoning_effort"], meter=meter, **extra)
 
-    def research(self, question: dict, meter: Meter) -> str:
-        """Sources, news and brief are independent: fetch them together, keep whatever succeeded."""
+    def research(self, question: dict, meter: Meter) -> tuple[str, dict]:
+        """Sources, news and brief are independent: fetch them together, keep whatever succeeded.
+        Returns the text and {"sources", "news", "brief"} → whether each part made it into the prompt."""
         jobs = {}
         with ThreadPoolExecutor(max_workers=3) as executor:
             if self.fetcher:
@@ -243,7 +264,7 @@ class Forecaster:
                     criteria=question.get("resolution_criteria") or "", fine_print=question.get("fine_print") or "")
                 jobs["brief"] = executor.submit(self._complete, self.config["research_model"], prompt, meter,
                                                 web=self.config["research_web"])
-        parts = []
+        parts, flags = [], {"sources": False, "news": False, "brief": False}
         for name, future in jobs.items():
             try:
                 result = future.result()
@@ -252,11 +273,14 @@ class Forecaster:
                 continue
             if name == "sources" and result:
                 parts.append(result[:SOURCES_CHARS])
+                flags["sources"] = True
             elif name == "news" and result:
                 parts.append(f"## Recent news (AskNews)\n{result[:NEWS_CHARS]}")
+                flags["news"] = True
             elif name == "brief":
                 parts.append(f"## Research brief\n{result.text[:BRIEF_CHARS]}")
-        return "\n\n".join(parts) or "No research available."
+                flags["brief"] = True
+        return "\n\n".join(parts) or "No research available.", flags
 
     def _context(self, question: dict, research: str) -> dict:
         return {
@@ -266,77 +290,121 @@ class Forecaster:
             "resolve": question.get("scheduled_resolve_time"), "research": research,
         }
 
-    def _ensemble(self, prompt: str, parse, meter: Meter) -> tuple[dict[str, list], list[str], int, int]:
-        """Every (model, run) in parallel → parsed values grouped by model, transcripts, parsed/total counts."""
+    def _ensemble(self, prompt: str, parse, meter: Meter, format_spec: str = "") -> tuple[dict[str, list], list[str],
+                                                                                        int, int, list[dict]]:
+        """Every (model, run) in parallel → parsed values grouped by model, transcripts, parsed/total counts, and one
+        record per run (model, ok, value, cost, tokens, reformatted, duration, error) for the ledger.
+        An answer that does not parse gets one cheap `reformat_model` call to extract its own final lines."""
         jobs = [model for model in self.config["models"] for _ in range(self.config["runs_per_model"])]
         by_model: dict[str, list] = {model: [] for model in self.config["models"]}
         texts: list[str] = []
+        runs: list[dict] = []
+
+        def account(record: dict, completion) -> None:
+            record["cost_usd"] += completion.cost_usd
+            record["prompt_tokens"] += completion.prompt_tokens
+            record["completion_tokens"] += completion.completion_tokens
 
         def run(model: str):
-            completion = self._complete(model, prompt, meter, temperature=0.5)
-            return completion, parse(completion.text)
+            started = time.monotonic()
+            record: dict = {"model": model, "ok": False, "reformatted": False, "cost_usd": 0.0,
+                            "prompt_tokens": 0, "completion_tokens": 0}
+            try:
+                completion = self._complete(model, prompt, meter, temperature=0.5)
+                account(record, completion)
+                text = completion.text
+                try:
+                    value = parse(text)
+                except ValueError as error:
+                    reformat = self.config.get("reformat_model")
+                    if not reformat:
+                        raise
+                    fixed = self.llm.complete(reformat, REFORMAT_PROMPT.format(format_spec=format_spec,
+                                                                                answer=text[-REFORMAT_CHARS:]),
+                                              max_tokens=REFORMAT_MAX_TOKENS, temperature=0.0, meter=meter)
+                    account(record, fixed)
+                    record["reformatted"] = True
+                    text = f"{text}\n[reformatted by {fixed.model}] {fixed.text}"
+                    try:
+                        value = parse(fixed.text)
+                    except ValueError as second:
+                        raise ValueError(f"{error}; after reformat: {second}") from second
+                record.update(ok=True, value=value)
+                return completion.model, text, value, record
+            except Exception as error:
+                error.run_record = record
+                raise
+            finally:
+                record["duration_s"] = round(time.monotonic() - started, 1)
 
         with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             futures = [(model, executor.submit(run, model)) for model in jobs]
             for model, future in futures:
                 try:
-                    completion, value = future.result()
+                    model_name, text, value, record = future.result()
                     by_model[model].append(value)
-                    texts.append(f"[{completion.model}] {completion.text[-COMMENT_RUN_CHARS:]}")
+                    texts.append(f"[{model_name}] {text[-COMMENT_RUN_CHARS:]}")
                 except Exception as error:  # one failed run must not sink the question
+                    record = getattr(error, "run_record", None) or {"model": model}
+                    record.update(ok=False, error=str(error)[:300])
                     texts.append(f"[{model} failed] {str(error)[:300]}")
+                runs.append(record)
         parsed = sum(len(values) for values in by_model.values())
         if parsed < max(2, len(jobs) // 2):
-            raise RuntimeError(f"only {parsed}/{len(jobs)} runs parsed ({failure_summary(texts)})")
-        return by_model, texts, parsed, len(jobs)
+            raise EnsembleError(f"only {parsed}/{len(jobs)} runs parsed ({failure_summary(texts)})", runs)
+        return by_model, texts, parsed, len(jobs), runs
 
     def forecast(self, post: dict) -> Forecast:
         meter = Meter()
         try:
             return self._forecast(post, meter)
+        except ForecastError:
+            raise
         except Exception as error:
             raise ForecastError(str(error), meter.cost_usd, meter.news_calls) from error
 
     def _forecast(self, post: dict, meter: Meter) -> Forecast:
         question = post["question"]
-        research = self.research(question, meter)
+        research, flags = self.research(question, meter)
         context = self._context(question, research)
         kind = question["type"]
-
-        if kind == "binary":
-            by_model, texts, ok, total = self._ensemble(COMMON.format(**context) + BINARY_TAIL, parse_probability,
-                                                        meter)
-            probability = aggregate_binary(by_model, tuple(self.config["binary_clamp"]), self.config["extremize"])
-            payload = {"probability_yes": probability, "probability_yes_per_category": None, "continuous_cdf": None}
-            summary: object = round(probability, 4)
-        elif kind == "multiple_choice":
-            options = question["options"]
-            tail = MC_TAIL.format(options_json=json.dumps(options))
-            by_model, texts, ok, total = self._ensemble(COMMON.format(**context) + tail,
-                                                        lambda text: parse_options(text, options), meter)
-            distribution = aggregate_options(by_model, options, self.config["mc_floor"])
-            payload = {"probability_yes": None, "probability_yes_per_category": distribution, "continuous_cdf": None}
-            summary = {option: round(value, 3) for option, value in distribution.items()}
-        elif kind in ("numeric", "discrete"):
-            scaling = question["scaling"]
-            scale = Scale(scaling["range_min"], scaling["range_max"], scaling.get("zero_point"),
-                          question["open_lower_bound"], question["open_upper_bound"])
-            cdf_size = scaling["inbound_outcome_count"] + 1 if kind == "discrete" else 201
-            bounds = []
-            if not scale.open_lower:
-                bounds.append(f"The outcome cannot be lower than {scale.lower}.")
-            if not scale.open_upper:
-                bounds.append(f"The outcome cannot be higher than {scale.upper}.")
-            tail = NUMERIC_TAIL.format(unit=question.get("unit") or "infer from question",
-                                       bounds_text=" ".join(bounds), lower=scale.lower, upper=scale.upper)
-            by_model, texts, ok, total = self._ensemble(
-                COMMON.format(**context) + tail,
-                lambda text: percentiles_to_cdf(parse_percentiles(text), scale, cdf_size), meter)
-            pooled = aggregate_cdfs(by_model)
-            payload = {"probability_yes": None, "probability_yes_per_category": None, "continuous_cdf": pooled}
-            summary = f"median≈{scale.to_value(next(i for i, h in enumerate(pooled) if h >= 0.5) / (cdf_size - 1)):.4g}"
-        else:
-            raise ValueError(f"unsupported question type {kind}")
+        try:
+            if kind == "binary":
+                by_model, texts, ok, total, runs = self._ensemble(COMMON.format(**context) + BINARY_TAIL,
+                                                                  parse_probability, meter, BINARY_TAIL)
+                probability = aggregate_binary(by_model, tuple(self.config["binary_clamp"]), self.config["extremize"])
+                payload = {"probability_yes": probability, "probability_yes_per_category": None, "continuous_cdf": None}
+                summary: object = round(probability, 4)
+            elif kind == "multiple_choice":
+                options = question["options"]
+                tail = MC_TAIL.format(options_json=json.dumps(options))
+                by_model, texts, ok, total, runs = self._ensemble(COMMON.format(**context) + tail,
+                                                                  lambda text: parse_options(text, options), meter, tail)
+                distribution = aggregate_options(by_model, options, self.config["mc_floor"])
+                payload = {"probability_yes": None, "probability_yes_per_category": distribution, "continuous_cdf": None}
+                summary = {option: round(value, 3) for option, value in distribution.items()}
+            elif kind in ("numeric", "discrete"):
+                scaling = question["scaling"]
+                scale = Scale(scaling["range_min"], scaling["range_max"], scaling.get("zero_point"),
+                              question["open_lower_bound"], question["open_upper_bound"])
+                cdf_size = scaling["inbound_outcome_count"] + 1 if kind == "discrete" else 201
+                bounds = []
+                if not scale.open_lower:
+                    bounds.append(f"The outcome cannot be lower than {scale.lower}.")
+                if not scale.open_upper:
+                    bounds.append(f"The outcome cannot be higher than {scale.upper}.")
+                tail = NUMERIC_TAIL.format(unit=question.get("unit") or "infer from question",
+                                           bounds_text=" ".join(bounds), lower=scale.lower, upper=scale.upper)
+                by_model, texts, ok, total, runs = self._ensemble(
+                    COMMON.format(**context) + tail,
+                    lambda text: percentiles_to_cdf(parse_percentiles(text), scale, cdf_size), meter, tail)
+                pooled = aggregate_cdfs(by_model)
+                payload = {"probability_yes": None, "probability_yes_per_category": None, "continuous_cdf": pooled}
+                summary = f"median≈{scale.to_value(next(i for i, h in enumerate(pooled) if h >= 0.5) / (cdf_size - 1)):.4g}"
+            else:
+                raise ValueError(f"unsupported question type {kind}")
+        except EnsembleError as error:
+            raise ForecastError(str(error), meter.cost_usd, meter.news_calls, error.runs, flags) from error
 
         sources = [name for name, used in (("resolution sources", self.fetcher), ("AskNews", self.news),
                                            (self.config["research_model"], True)) if used and name]
@@ -345,4 +413,4 @@ class Forecaster:
                    f"## Research\n{research[:COMMENT_RESEARCH_CHARS]}\n\n"
                    + "\n\n".join(f"## Run {index + 1}\n{text}" for index, text in enumerate(texts)))
         return Forecast(question["id"], post["id"], kind, payload, summary, comment, meter.cost_usd,
-                        meter.news_calls, texts, ok, total)
+                        meter.news_calls, texts, ok, total, flags, runs)

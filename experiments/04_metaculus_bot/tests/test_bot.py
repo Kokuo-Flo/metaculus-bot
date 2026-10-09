@@ -146,6 +146,14 @@ class SpendGuard(unittest.TestCase):
         # typical: 2 × (6500*2e-6 + 1500*12e-6) = 0.062 ; research 0.003 + 0.012 + 0.005 = 0.02
         self.assertAlmostEqual(question_typical_usd(PAID, PRICES), 0.082)
 
+    def test_reformat_calls_are_bounded_but_expected_to_be_rare(self):
+        config = {**PAID, "reformat_model": "paid/cheap"}
+        # bound: + 2 runs × (2000 × 2e-7 + 600 × 1.2e-6) ; typical: + 0.15 × 2 × (1200 × 2e-7 + 80 × 1.2e-6)
+        self.assertAlmostEqual(question_bound_usd(config, PRICES), 0.09224, places=6)
+        self.assertAlmostEqual(question_typical_usd(config, PRICES), 0.0821008, places=7)
+        with self.assertRaises(BudgetExceeded):
+            question_bound_usd({**PAID, "reformat_model": "unknown/model"}, PRICES)
+
     def test_unknown_price_refused(self):
         with self.assertRaises(BudgetExceeded):
             question_bound_usd({**PAID, "models": ["unknown/model"]}, PRICES)
@@ -198,7 +206,13 @@ class SpendGuard(unittest.TestCase):
 class OpenRouterClient(unittest.TestCase):
     CATALOG = {"openai/x": {"pricing": {}, "supported_parameters": {"max_tokens", "reasoning"}},
                "google/y": {"pricing": {}, "supported_parameters": {"max_tokens", "temperature"}}}
-    OK = {"choices": [{"message": {"content": "Probability: 5%"}}], "usage": {"cost": 0.02}}
+    OK = {"choices": [{"message": {"content": "Probability: 5%"}}],
+          "usage": {"cost": 0.02, "prompt_tokens": 1200, "completion_tokens": 300}}
+
+    def test_tokens_and_cost_are_reported(self):
+        with mock.patch.object(clients, "_request", return_value=self.OK):
+            completion = OpenRouter(api_key="k", catalog=self.CATALOG).complete("openai/x", "p")
+        self.assertEqual((completion.prompt_tokens, completion.completion_tokens, completion.cost_usd), (1200, 300, 0.02))
 
     def test_unsupported_parameters_are_not_sent(self):
         with mock.patch.object(clients, "_request", return_value=self.OK) as request:
@@ -259,6 +273,32 @@ class ForecasterPipeline(unittest.TestCase):
             Forecaster(llm, config, news=None, fetcher=None).forecast(self.POST)
         self.assertAlmostEqual(caught.exception.cost_usd, 0.05)
         self.assertIn("only 1/4 runs parsed", str(caught.exception))
+        self.assertEqual(len(caught.exception.runs), 4)  # the records survive the failure, for the ledger
+        self.assertEqual(sum(1 for run in caught.exception.runs if run["ok"]), 1)
+        self.assertEqual(caught.exception.research, {"sources": False, "news": False, "brief": True})
+
+    def test_reformat_rescues_unparsable_answers(self):
+        llm = self.LLM(["brief", "garbage", "Probability: 40%", "garbage", "Probability: 35%",
+                        "Probability: 30%", "Probability: 50%"])  # the last two answer the reformat calls
+        config = {**PAID, "models": ["a", "b"], "runs_per_model": 2, "reformat_model": "fixer",
+                  "binary_clamp": [0.01, 0.99], "extremize": 1.0, "reasoning_effort": None}
+        forecast = Forecaster(llm, config, news=None, fetcher=None).forecast(self.POST)
+        self.assertEqual((forecast.runs_ok, forecast.runs_total), (4, 4))
+        self.assertEqual(sum(1 for run in forecast.run_records if run["reformatted"]), 2)
+        self.assertTrue(all(run["ok"] for run in forecast.run_records))
+        self.assertIn("[reformatted by fixer]", forecast.comment)
+        self.assertEqual(forecast.research, {"sources": False, "news": False, "brief": True})
+        self.assertAlmostEqual(forecast.cost_usd, 0.07)  # 1 brief + 4 runs + 2 reformat calls at 0.01 each
+        self.assertEqual(len(llm.answers), 0)
+
+    def test_reformat_that_still_fails_is_a_failed_run(self):
+        llm = self.LLM(["brief", "garbage", "Probability: 40%", "NONE"])
+        config = {**PAID, "models": ["a", "b"], "runs_per_model": 1, "reformat_model": "fixer", "reasoning_effort": None}
+        with self.assertRaises(ForecastError) as caught:
+            Forecaster(llm, config, news=None, fetcher=None).forecast(self.POST)
+        self.assertIn("only 1/2 runs parsed", str(caught.exception))
+        self.assertEqual(sum(1 for run in caught.exception.runs if run["ok"]), 1)
+        self.assertEqual(sum(1 for run in caught.exception.runs if run.get("reformatted")), 1)
 
     def test_failure_reasons_are_summarised_in_the_error(self):
         llm = self.LLM(["brief", RuntimeError("POST u → HTTP 429: upstream"), RuntimeError("POST u → HTTP 429: x"),
@@ -549,6 +589,18 @@ class FaultInjection(unittest.TestCase):
         self.assertIn("[discover] broken: GET /posts/", err)
         self.assertIn("done=7 failed=0", out)
         self.assertEqual([row[0] for row in db.execute("SELECT ok FROM operation WHERE kind='discover' ORDER BY id")], [0, 1])
+
+    def test_every_model_run_is_recorded_for_offline_replay(self):
+        code, out, err, db = self.run_bot()
+        self.assertEqual(code, 0)
+        rows = db.execute("SELECT ok, reformatted, submitted, value IS NOT NULL, model FROM run").fetchall()
+        self.assertEqual(len(rows), 42)  # 7 questions × (2 models × 3 runs)
+        self.assertTrue(all(row[:4] == (1, 0, 1, 1) for row in rows))
+        self.assertEqual(db.execute("SELECT COUNT(DISTINCT question_id) FROM run").fetchone()[0], 7)
+        detail = db.execute("SELECT detail FROM operation WHERE kind='forecast' AND ok=1").fetchone()[0]
+        self.assertIn('"research": {"sources": ', detail)
+        self.assertIn('"brief": true', detail)
+        self.assertIn('"reformatted": 0', detail)
 
     def test_zero_time_budget_stops_cleanly_before_any_question(self):
         code, out, err, db = self.run_bot("--time-budget", "0")

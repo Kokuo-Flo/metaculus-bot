@@ -149,6 +149,8 @@ class Completion:
     text: str
     cost_usd: float
     model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class Meter:
@@ -219,7 +221,8 @@ class OpenRouter:
         text = strip_thinking(choice["message"].get("content") or "")
         if not text:  # reasoning can eat the whole max_tokens budget: count the cost, fail the run
             raise RuntimeError(f"{model}: empty answer (finish_reason={choice.get('finish_reason')})")
-        return Completion(text, cost, model)
+        return Completion(text, cost, model, int(usage.get("prompt_tokens") or 0),
+                          int(usage.get("completion_tokens") or 0))
 
 
 # --- News ---

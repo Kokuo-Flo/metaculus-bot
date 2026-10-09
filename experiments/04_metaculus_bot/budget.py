@@ -19,8 +19,10 @@ from datetime import date, datetime, timedelta, timezone
 from clients import model_catalog
 
 # Forecast prompt ≈ template + background (6 000 chars) + sources (9 000) + news (8 000) + brief (12 000), ~3.5 chars/token
-INPUT_TOKENS_BOUND = {"research": 1_500, "forecast": 12_500}
-TYPICAL_TOKENS = {"research": (1_500, 1_500), "forecast": (6_500, 1_500)}  # (input, output): prior estimate only
+INPUT_TOKENS_BOUND = {"research": 1_500, "forecast": 12_500, "reformat": 2_000}
+OUTPUT_TOKENS_BOUND = {"reformat": 600}  # other kinds: the profile's max_tokens
+TYPICAL_TOKENS = {"research": (1_500, 1_500), "forecast": (6_500, 1_500), "reformat": (1_200, 80)}  # (input, output)
+REFORMAT_RATE = 0.15  # share of runs expected to need the reformat call (prior; the ledger measures it per run)
 MIN_SAMPLES = 3  # measured questions before the measured mean replaces the prior
 
 
@@ -37,6 +39,8 @@ def _calls(config: dict) -> list[tuple[str, str]]:
     calls = [(model, "forecast") for model in config["models"] for _ in range(config["runs_per_model"])]
     if config.get("research_model"):
         calls.append((config["research_model"], "research"))
+    if config.get("reformat_model"):  # worst case: every run needs its answer reformatted
+        calls.extend((config["reformat_model"], "reformat") for _ in range(len(calls) - bool(config.get("research_model"))))
     return calls
 
 
@@ -49,15 +53,15 @@ def _check_prices(config: dict, prices: dict[str, dict]) -> None:
 def question_bound_usd(config: dict, prices: dict[str, dict]) -> float:
     _check_prices(config, prices)
     web = bool(config.get("research_web"))
-    return sum(call_usd(prices[model], INPUT_TOKENS_BOUND[kind], config["max_tokens"], web and kind == "research")
-               for model, kind in _calls(config))
+    return sum(call_usd(prices[model], INPUT_TOKENS_BOUND[kind], OUTPUT_TOKENS_BOUND.get(kind, config["max_tokens"]),
+                        web and kind == "research") for model, kind in _calls(config))
 
 
 def question_typical_usd(config: dict, prices: dict[str, dict]) -> float:
     _check_prices(config, prices)
     web = bool(config.get("research_web"))
     return sum(call_usd(prices[model], *TYPICAL_TOKENS[kind], web and kind == "research")
-               for model, kind in _calls(config))
+               * (REFORMAT_RATE if kind == "reformat" else 1.0) for model, kind in _calls(config))
 
 
 class Budget:

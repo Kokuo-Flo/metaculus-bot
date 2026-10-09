@@ -72,6 +72,11 @@ def init_store(connection: sqlite3.Connection) -> None:
     for column, kind in (("profile", "TEXT"), ("comment", "TEXT"), ("commented", "INTEGER")):
         if column not in columns:  # session-1 ledgers predate these columns
             connection.execute(f"ALTER TABLE forecast ADD COLUMN {column} {kind}")
+    connection.execute("""CREATE TABLE IF NOT EXISTS run (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, question_id INTEGER, post_id INTEGER, tournament TEXT,
+        profile TEXT, model TEXT, ok INTEGER, reformatted INTEGER, value TEXT, cost_usd REAL, prompt_tokens INTEGER,
+        completion_tokens INTEGER, duration_s REAL, error TEXT, submitted INTEGER)""")  # one row per model run:
+    # what each model answered, so aggregation rules can be replayed offline once questions resolve
     connection.commit()
 
 
@@ -193,6 +198,17 @@ class Cycle:
         for _ in range(news_calls if self.source == "measured" else 0):
             self.ledger.operation(STRATEGY_ID, "asknews", True, post=post["id"])
 
+    def record_runs(self, question_id, post_id, tournament, profile: str, runs: list[dict], submitted: bool) -> None:
+        self.ledger.connection.executemany(
+            "INSERT INTO run (ts, question_id, post_id, tournament, profile, model, ok, reformatted, value, cost_usd,"
+            " prompt_tokens, completion_tokens, duration_s, error, submitted)"
+            " VALUES (strftime('%Y-%m-%dT%H:%M:%f','now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(question_id, post_id, str(tournament), profile, run.get("model"), int(bool(run.get("ok"))),
+              int(bool(run.get("reformatted"))), json.dumps(run.get("value")) if run.get("ok") else None,
+              run.get("cost_usd"), run.get("prompt_tokens"), run.get("completion_tokens"), run.get("duration_s"),
+              run.get("error"), int(submitted)) for run in runs])
+        self.ledger.connection.commit()
+
     def finish(self, future: Future, tournament, post: dict, profile: str, started: float) -> None:
         duration = time.monotonic() - started
         question_id = post["question"].get("id")
@@ -201,8 +217,9 @@ class Cycle:
         except ForecastError as error:
             self.failed += 1
             self.book(post, profile, error.cost_usd, error.news_calls)
+            self.record_runs(question_id, post["id"], tournament, profile, error.runs, False)
             self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=question_id, profile=profile,
-                                  error=str(error)[:500])
+                                  research=error.research, error=str(error)[:500])
             print(f"[fail] q{question_id} [{profile}]: {error}", file=sys.stderr)
             return
         self.book(post, profile, forecast.cost_usd, forecast.news_calls)
@@ -211,10 +228,12 @@ class Cycle:
                 self.metaculus.forecast(forecast.question_id, forecast.payload)
         except Exception as error:  # the API refused the payload: a failed question, already paid for
             self.failed += 1
+            self.record_runs(question_id, post["id"], tournament, profile, forecast.run_records, False)
             self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=forecast.question_id,
-                                  profile=profile, error=f"submit: {str(error)[:450]}")
+                                  profile=profile, research=forecast.research, error=f"submit: {str(error)[:450]}")
             print(f"[fail] q{question_id} submit: {error}", file=sys.stderr)
             return
+        self.record_runs(question_id, post["id"], tournament, profile, forecast.run_records, not self.args.dry_run)
         self.ledger.connection.execute(
             "INSERT INTO forecast (question_id, post_id, tournament, ts, type, payload, summary, cost_usd,"
             " submitted, profile, comment, commented)"
@@ -228,7 +247,8 @@ class Cycle:
                               type=forecast.question_type, profile=profile, summary=forecast.summary,
                               tournament=str(tournament), submitted=not self.args.dry_run,
                               runs_parsed=f"{forecast.runs_ok}/{forecast.runs_total}",
-                              cost_usd=round(forecast.cost_usd, 4))
+                              reformatted=sum(1 for run in forecast.run_records if run.get("reformatted")),
+                              research=forecast.research, cost_usd=round(forecast.cost_usd, 4))
         self.done += 1
         shown = "(hidden while open)" if self.hide_values else forecast.summary
         print(f"[ok] q{forecast.question_id} {forecast.question_type} [{profile}]: {shown} "

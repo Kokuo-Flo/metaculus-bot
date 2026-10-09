@@ -1,0 +1,21 @@
+# Unit tests + offline self-test on every push and pull request. Independent of metaculus-bot.yaml (no shared
+# concurrency group), so it never delays or blocks the scheduled forecasting runs.
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+        working-directory: experiments/04_metaculus_bot
+      - run: python3 bot.py --mode fixtures --ledger "$RUNNER_TEMP/ledger.sqlite"
+        working-directory: experiments/04_metaculus_bot

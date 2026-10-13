@@ -4,6 +4,7 @@ Usage:
   python3 bot.py --mode fixtures            # offline: fixture questions + fake LLM, nothing leaves the machine
   python3 bot.py --mode test [--dry-run]    # bot-testing-area tournament (needs METACULUS_TOKEN, OPENROUTER_API_KEY)
   python3 bot.py --mode tournament          # every tournament where bot accounts may win prizes (TOURNAMENTS)
+  python3 bot.py --mode smoke [--dry-run]   # one fixed 50 % forecast + private note on bot-testing-area, read back
   --profile full|standard|cheap|free        # force one profile; default: bot_config.json `profile_chain`
   --parallel N --time-budget S              # questions handled at once; stop taking new ones after S seconds
 Rules honoured (Metaculus): no human in the loop, one entry per competition (the bot account only), a reasoning
@@ -40,6 +41,7 @@ STRATEGY_ID = "metaculus-futureeval"
 # practice only). Ids/slugs follow forecasting-tools' MetaculusClient constants.
 TOURNAMENTS = {
     "test": ["bot-testing-area"],
+    "smoke": ["bot-testing-area"],  # --mode smoke: one fixed 50 % forecast + private note, then read back; no LLM
     "tournament": [33121, "minibench"],  # Fall FutureEval 2026, rolling MiniBench
     # Parked (pacing settings kept in bot_config.json): "market-pulse-26q4" and 33016 (Animal Futures). Re-enable
     # only once (a) their rules are verified (scoring over the lifetime or at close? Animal Futures' "hold forecasts
@@ -175,6 +177,57 @@ def post_notes(ledger: Ledger, metaculus) -> None:
             ledger.operation(STRATEGY_ID, "comment", False, post=post_id, error=str(error)[:300])
 
 
+def smoke_test(metaculus, ledger: Ledger, dry_run: bool = False) -> int:
+    """Exercise the submission path alone, for free: a fixed 50 % forecast and a private note on one open binary
+    question of bot-testing-area, then read the question back to see what `my_forecasts.latest` looks like."""
+    now = datetime.now(timezone.utc)
+    candidates = [post for post in metaculus.open_posts("bot-testing-area")
+                  if post.get("question") and post["question"].get("type") == "binary"
+                  and (close_time(post) or now) > now + timedelta(hours=1)]
+    if not candidates:
+        print("[smoke] no open binary question in bot-testing-area", file=sys.stderr)
+        return 1
+    fresh = [post for post in candidates if not already_forecast(post)]
+    post = (fresh or candidates)[0]
+    question_id = post["question"]["id"]
+    print(f"[smoke] question q{question_id} (post {post['id']}): {post.get('title', '')[:90]}")
+    if dry_run:
+        print("[smoke] dry run: nothing submitted")
+        return 0
+    payload = {"probability_yes": 0.5, "probability_yes_per_category": None, "continuous_cdf": None}
+    try:
+        metaculus.forecast(question_id, payload)
+        print("[smoke] forecast POST accepted")
+    except Exception as error:
+        ledger.operation(STRATEGY_ID, "smoke", False, question=question_id, step="forecast", error=str(error)[:400])
+        print(f"[smoke] forecast POST refused: {error}", file=sys.stderr)
+        return 1
+    note = ("Smoke test: fixed 50 % forecast to verify the submission and private-note path of an automated bot. "
+            "Not a real forecast.")
+    try:
+        metaculus.comment(post["id"], note)
+        print("[smoke] private note POST accepted")
+        note_ok = True
+    except Exception as error:
+        note_ok = False
+        print(f"[smoke] private note POST refused: {error}", file=sys.stderr)
+    try:
+        detail = metaculus.post(post["id"])
+        latest = (detail.get("question") or {}).get("my_forecasts", {}).get("latest")
+        start = (latest or {}).get("start_time")
+        print(f"[smoke] read back: my_forecasts.latest = {json.dumps(latest)[:300]}")
+        print(f"[smoke] start_time={start!r} ({type(start).__name__}) → last_forecast_time="
+              f"{last_forecast_time(detail['question'])} already_forecast={already_forecast(detail)}")
+        ok = bool(latest and latest.get("forecast_values") is not None)
+    except Exception as error:
+        ok, latest, start = False, None, None
+        print(f"[smoke] read back failed: {error}", file=sys.stderr)
+    ledger.operation(STRATEGY_ID, "smoke", ok and note_ok, question=question_id, post=post["id"], note=note_ok,
+                     latest=latest, start_time_type=type(start).__name__)
+    print(f"[smoke] {'OK' if ok and note_ok else 'PROBLEM'}: forecast visible={ok} note={note_ok}")
+    return 0 if ok and note_ok else 1
+
+
 def exit_code(done: int, failed: int, discovered: int) -> int:
     """0 = the run did its job or had nothing to do; 1 = nothing worked (no tournament listed, or every question
     failed). Partial failures stay green: the ledger and the daily coverage report carry them, and a red scheduled
@@ -273,6 +326,8 @@ def main() -> int:
     ledger.register(STRATEGY_ID, "Metaculus FutureEval bot tournament", status="paper" if offline else "active",
                     proof_level=1)
     init_store(ledger.connection)
+    if args.mode == "smoke":  # needs METACULUS_TOKEN only
+        return smoke_test(MetaculusClient(), ledger, dry_run=args.dry_run)
     raw = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     chain = [resolve_config(raw, name) for name in
              ([args.profile] if args.profile else raw.get("profile_chain") or [raw.get("profile")])]

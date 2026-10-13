@@ -702,5 +702,60 @@ class Replay(unittest.TestCase):
         self.assertEqual(table["extremize_1.6"]["n"], 1)  # binary only
 
 
+class SmokeMode(unittest.TestCase):
+    class RecordingFixture(bot.FixtureMetaculus):
+        """Fixture client whose forecast() shows up in the next read-back, like the real API."""
+        instances: list = []
+
+        def __init__(self):
+            super().__init__()
+            SmokeMode.RecordingFixture.instances.append(self)
+            self.notes = []
+
+        def forecast(self, question_id, payload):
+            super().forecast(question_id, payload)
+            for post in self.posts.values():
+                if post.get("question", {}).get("id") == question_id:
+                    post["question"]["my_forecasts"] = {"latest": {"forecast_values": [0.5, 0.5], "start_time": 1760000000.5}}
+
+        def comment(self, post_id, text):
+            self.notes.append((post_id, text))
+
+    def run_smoke(self, *extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["bot.py", "--mode", "smoke", "--ledger", str(Path(tmp) / "l.sqlite"), *extra]
+            with mock.patch.object(bot, "MetaculusClient", self.RecordingFixture), \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                code = bot.main()
+            db = sqlite3.connect(Path(tmp) / "l.sqlite")
+            ops = db.execute("SELECT ok, detail FROM operation WHERE kind='smoke'").fetchall()
+        return code, out.getvalue(), err.getvalue(), ops
+
+    def test_smoke_submits_one_fixed_forecast_and_reads_it_back(self):
+        self.RecordingFixture.instances.clear()
+        code, out, err, ops = self.run_smoke()
+        self.assertEqual(code, 0, err)
+        client = self.RecordingFixture.instances[-1]
+        self.assertEqual(len(client.submitted), 1)
+        self.assertEqual(client.submitted[0][1]["probability_yes"], 0.5)
+        self.assertEqual(len(client.notes), 1)
+        self.assertIn("Smoke test", client.notes[0][1])
+        self.assertIn("forecast POST accepted", out)
+        self.assertIn("start_time=1760000000.5 (float)", out)
+        self.assertIn("already_forecast=True", out)
+        self.assertIn("[smoke] OK", out)
+        self.assertEqual([op[0] for op in ops], [1])
+
+    def test_smoke_dry_run_submits_nothing(self):
+        self.RecordingFixture.instances.clear()
+        code, out, err, ops = self.run_smoke("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.RecordingFixture.instances[-1].submitted, [])
+        self.assertIn("nothing submitted", out)
+        self.assertEqual(ops, [])
+
+
 if __name__ == "__main__":
     unittest.main()

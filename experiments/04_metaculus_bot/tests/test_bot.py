@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bot  # noqa: E402
 import clients  # noqa: E402
 import news_free  # noqa: E402
+import probe_free  # noqa: E402
 from budget import Budget, BudgetExceeded, question_bound_usd, question_typical_usd  # noqa: E402
 from clients import KeyStatus, Meter, OpenRouter, strip_thinking  # noqa: E402
 from forecaster import (ForecastError, Forecaster, aggregate_binary, aggregate_options, parse_options,  # noqa: E402
@@ -883,6 +884,21 @@ class FreeQuota(FaultInjection):
         self.assertEqual((kept[0]["models"], kept[0]["research_model"]), (["a:free"], None))
         self.assertIn("GROQ_API_KEY", out.getvalue())
         self.assertEqual(bot.free_calls({"models": ["a:free", "groq/x", "b"], "runs_per_model": 2, "research_model": "c:free"}), 3)
+
+
+class ProviderProbe(unittest.TestCase):
+    def test_provider_listing_strips_gemini_prefix_and_sorts(self):
+        listing = {"data": [{"id": "models/gemini-2.5-flash"}, {"id": "models/gemini-2.5-pro"}, {"id": "llama-3.3-70b"}]}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(listing).encode()
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            ids = probe_free.provider_models("https://x/v1", "k")
+        self.assertEqual(ids, ["gemini-2.5-flash", "gemini-2.5-pro", "llama-3.3-70b"])
+
+    def test_configured_models_come_from_the_real_config(self):
+        self.assertIn("gemini-2.5-flash", probe_free.configured_models("gemini"))
+        self.assertEqual(probe_free.configured_models("mistral"), [])
+        self.assertIn("Probability: ZZ%", probe_free.realistic_prompt())
 
 
 if __name__ == "__main__":

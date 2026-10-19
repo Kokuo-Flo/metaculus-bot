@@ -13,6 +13,17 @@ median per family, log-odds mean across families → Metaculus payload + one sho
 Secrets (`.env` locally, repository secrets on GitHub): `METACULUS_TOKEN`, `OPENROUTER_API_KEY`, optional
 `ASKNEWS_API_KEY` or `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET`. Lines are bare `KEY=value`.
 
+## Running on free models only (the default since 2026-10-19)
+
+Metaculus gave no LLM credits this season, so `profile_chain` is `["free"]`: OpenRouter free models measured with
+`probe_free.py` (Nemotron 3 Ultra / Super / Nano), 8 000 output tokens, no paid web search. Research comes from the
+resolution sources, Google News headlines and a Wikipedia intro (`news_free.py`), plus AskNews when configured.
+OpenRouter caps a no-credit account at ~50 free requests per day: `budget.free_requests_per_day` (45) and
+`free_requests_reserve` (12, kept for prize-heavy tournaments) ration them, and the run stops cleanly when the API
+reports the cap. Models written `groq/…`, `cerebras/…`, `gemini/…`, `mistral/…`, `nim/…` run only when the matching
+key is set (free tiers without a card; verify ids with each provider's `/models`). `probe_free.py` measures which
+free models answer, how fast, and the daily cap.
+
 ## Modules
 
 | File | Role |

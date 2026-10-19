@@ -30,10 +30,12 @@ ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT))  # repo root → engine.*
 
 from budget import Budget, BudgetExceeded  # noqa: E402
-from clients import AskNews, FakeLLM, FakeNews, FixtureMetaculus, MetaculusClient, OpenRouter, model_catalog  # noqa: E402
+from clients import (AskNews, FakeLLM, FakeNews, FixtureMetaculus, LLMRouter, MetaculusClient, OpenRouter,  # noqa: E402
+                     PROVIDERS, model_catalog, split_model)
 from engine.costs import usd_to_eur  # noqa: E402
 from engine.ledger import Ledger  # noqa: E402
-from forecaster import ForecastError, Forecaster, resolve_config  # noqa: E402
+from forecaster import ForecastError, Forecaster, resolve_config
+from news_free import free_research  # noqa: E402
 from sources import fetch  # noqa: E402
 
 STRATEGY_ID = "metaculus-futureeval"
@@ -228,11 +230,47 @@ def smoke_test(metaculus, ledger: Ledger, dry_run: bool = False) -> int:
     return 0 if ok and note_ok else 1
 
 
-def exit_code(done: int, failed: int, discovered: int) -> int:
+def exit_code(done: int, failed: int, discovered: int, stop: str | None = None) -> int:
     """0 = the run did its job or had nothing to do; 1 = nothing worked (no tournament listed, or every question
     failed). Partial failures stay green: the ledger and the daily coverage report carry them, and a red scheduled
-    run every 20 min would only mail the repository owner."""
+    run every 20 min would only mail the repository owner. A run cut short by the free quota is expected, not red."""
+    if stop and "quota" in stop:
+        return 0
     return 1 if discovered == 0 or (failed and not done) else 0
+
+
+def available_profiles(chain: list[dict], llm) -> list[dict]:
+    """Drop the models whose provider key is not set (and profiles left without any model), saying which key
+    would bring them back; research and reformat models fall back to none."""
+    kept = []
+    for config in chain:
+        missing = [model for model in config["models"] if not llm.available(model)]
+        if missing:
+            keys = sorted({PROVIDERS[split_model(model)[0]][1] for model in missing})
+            print(f"[models] {config['profile']}: {len(missing)} model(s) need {', '.join(keys)}: {missing}")
+        config = {**config, "models": [model for model in config["models"] if llm.available(model)]}
+        for field in ("research_model", "reformat_model"):
+            if config.get(field) and not llm.available(config[field]):
+                config[field] = None
+        if config["models"]:
+            kept.append(config)
+    return kept
+
+
+def is_free_openrouter(model: str | None) -> bool:
+    return bool(model) and model.endswith(":free") and split_model(model)[0] == "openrouter"
+
+
+def free_calls(config: dict) -> int:
+    """OpenRouter free-model requests one question of this profile costs (they are the ones capped per day)."""
+    runs = sum(config["runs_per_model"] for model in config["models"] if is_free_openrouter(model))
+    return runs + int(is_free_openrouter(config.get("research_model")))
+
+
+def free_requests_last_24h(ledger: Ledger) -> int:
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+    rows = ledger.connection.execute("SELECT model FROM run WHERE ts >= ?", (since,)).fetchall()
+    return sum(1 for row in rows if is_free_openrouter(row[0]))
 
 
 class Cycle:
@@ -271,6 +309,8 @@ class Cycle:
             self.failed += 1
             self.book(post, profile, error.cost_usd, error.news_calls)
             self.record_runs(question_id, post["id"], tournament, profile, error.runs, False)
+            if any("free-models-per-day" in (run.get("error") or "") for run in error.runs):
+                self.stop = "free quota exhausted for today (OpenRouter free-models-per-day); the next run retries"
             self.ledger.operation(STRATEGY_ID, "forecast", False, duration, question=question_id, profile=profile,
                                   research=error.research, error=str(error)[:500])
             print(f"[fail] q{question_id} [{profile}]: {error}", file=sys.stderr)
@@ -336,14 +376,27 @@ def main() -> int:
 
     metaculus = FixtureMetaculus() if offline else MetaculusClient()
     catalog = {} if offline else model_catalog()
-    llm = FakeLLM() if offline else OpenRouter(catalog=catalog)
+    llm = FakeLLM() if offline else LLMRouter.from_env(catalog)
+    if not offline:
+        chain = available_profiles(chain, llm)
+        if not chain:
+            print("[models] no usable model in any profile (missing provider keys?)", file=sys.stderr)
+            return 1
+    prices = {model: info["pricing"] for model, info in catalog.items()}
+    for config in chain:  # provider models outside OpenRouter are free tiers: no public price, zero cost
+        for model in (*config["models"], config.get("research_model"), config.get("reformat_model")):
+            if model and split_model(model)[0] != "openrouter":
+                prices.setdefault(model, {"prompt": "0", "completion": "0"})
     news = FakeNews() if offline else AskNews.from_env(
         limits["asknews_calls_per_month"] - asknews_calls_this_month(ledger))
     fetcher = (lambda url: f"[offline] would fetch {url}") if offline else fetch
-    forecasters = {config["profile"]: Forecaster(llm, config, news, fetcher) for config in chain}
+    headlines = (lambda title: "[offline] no headlines") if offline else free_research
+    forecasters = {config["profile"]: Forecaster(llm, config, news, fetcher, headlines) for config in chain}
     source = "estimated" if offline else "measured"
-    budget = None if offline else Budget(limits, llm, ledger, STRATEGY_ID, usd_to_eur,
-                                         {model: info["pricing"] for model, info in catalog.items()})
+    budget = None if offline else Budget(limits, llm, ledger, STRATEGY_ID, usd_to_eur, prices)
+    free_used = free_requests_last_24h(ledger)  # OpenRouter free requests already spent in the last 24 h
+    free_cap, free_reserve = limits.get("free_requests_per_day", 45), limits.get("free_requests_reserve", 12)
+    quota_skipped = 0
     # Logs of a public repo's Actions runs are public, and a question stays open ~1.5 h after we forecast it:
     # never print live tournament forecasts there (the ledger keeps them; Metaculus shows them after close).
     hide_values = os.environ.get("GITHUB_ACTIONS") == "true" and args.mode == "tournament" and not args.dry_run
@@ -367,7 +420,8 @@ def main() -> int:
             if post.get("question") or post.get("group_of_questions"):
                 posts.setdefault(post["id"], (tournament, post))
     far = datetime.max.replace(tzinfo=timezone.utc)
-    queue = sorted(posts.values(), key=lambda item: close_time(item[1]) or far)  # soonest window first
+    queue = sorted(posts.values(), key=lambda item: (  # prize-heavy tournaments first, then soonest window
+        -tournament_settings.get(str(item[0]), {}).get("pace_share", 1.0), close_time(item[1]) or far))
 
     run_started = time.monotonic()
     executor = ThreadPoolExecutor(max_workers=max(1, args.parallel))
@@ -387,6 +441,8 @@ def main() -> int:
         detail = None
         for post in expand(summary_post):
             reap(block=False)
+            if cycle.stop:
+                break
             if cycle.done + cycle.failed + len(running) >= args.max_questions:
                 cycle.stop = f"max-questions {args.max_questions} reached; the next run continues"
                 break
@@ -432,11 +488,22 @@ def main() -> int:
                 break
             if skipped_profiles:
                 print(f"[budget] q{post['question'].get('id')} → {config['profile']} ({skipped_profiles})")
+            calls = free_calls(config)
+            allowance = free_cap - (0 if settings.get("pace_share", 1.0) >= 1.0 else free_reserve)
+            if calls and free_used + calls > allowance:  # keep the reserve for prize-heavy tournaments
+                quota_skipped += 1
+                cycle.skipped += 1
+                continue
+            free_used += calls
             future = executor.submit(forecasters[config["profile"]].forecast, post)
             running[future] = (tournament, post, config["profile"], time.monotonic())
     while running:
         reap(block=True)
     executor.shutdown(wait=True)
+    if quota_skipped:
+        ledger.operation(STRATEGY_ID, "skip", True, reason="free quota", questions=quota_skipped, used=free_used,
+                         cap=free_cap)
+        print(f"[quota] {quota_skipped} question(s) left for later: {free_used}/{free_cap} free requests in 24 h")
     if not args.dry_run:
         post_notes(ledger, metaculus)
 
@@ -450,7 +517,7 @@ def main() -> int:
           + (f" stop={cycle.stop}" if cycle.stop else ""))
     if offline:
         print(f"fixture submissions captured: {len(metaculus.submitted)}")
-    return exit_code(cycle.done, cycle.failed, discovered)
+    return exit_code(cycle.done, cycle.failed, discovered, cycle.stop)
 
 
 if __name__ == "__main__":

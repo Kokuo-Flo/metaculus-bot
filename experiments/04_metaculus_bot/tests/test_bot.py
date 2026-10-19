@@ -6,6 +6,7 @@ Run from experiments/04_metaculus_bot:  python3 -m unittest discover -s tests -p
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
 import clients  # noqa: E402
+import news_free  # noqa: E402
 from budget import Budget, BudgetExceeded, question_bound_usd, question_typical_usd  # noqa: E402
 from clients import KeyStatus, Meter, OpenRouter, strip_thinking  # noqa: E402
 from forecaster import (ForecastError, Forecaster, aggregate_binary, aggregate_options, parse_options,  # noqa: E402
@@ -276,7 +278,7 @@ class ForecasterPipeline(unittest.TestCase):
         self.assertIn("only 1/4 runs parsed", str(caught.exception))
         self.assertEqual(len(caught.exception.runs), 4)  # the records survive the failure, for the ledger
         self.assertEqual(sum(1 for run in caught.exception.runs if run["ok"]), 1)
-        self.assertEqual(caught.exception.research, {"sources": False, "news": False, "brief": True})
+        self.assertEqual(caught.exception.research, {"sources": False, "headlines": False, "news": False, "brief": True})
 
     def test_reformat_rescues_unparsable_answers(self):
         llm = self.LLM(["brief", "garbage", "Probability: 40%", "garbage", "Probability: 35%",
@@ -288,9 +290,19 @@ class ForecasterPipeline(unittest.TestCase):
         self.assertEqual(sum(1 for run in forecast.run_records if run["reformatted"]), 2)
         self.assertTrue(all(run["ok"] for run in forecast.run_records))
         self.assertIn("[reformatted by fixer]", forecast.comment)
-        self.assertEqual(forecast.research, {"sources": False, "news": False, "brief": True})
+        self.assertEqual(forecast.research, {"sources": False, "headlines": False, "news": False, "brief": True})
         self.assertAlmostEqual(forecast.cost_usd, 0.07)  # 1 brief + 4 runs + 2 reformat calls at 0.01 each
         self.assertEqual(len(llm.answers), 0)
+
+    def test_free_headlines_join_the_research(self):
+        llm = self.LLM(["brief", "Probability: 30%", "Probability: 40%"])
+        config = {**PAID, "models": ["a", "b"], "runs_per_model": 1, "binary_clamp": [0.01, 0.99], "extremize": 1.0,
+                  "reasoning_effort": None}
+        headlines = lambda title: f"## Recent headlines\n- Mon, 19 Oct 2026: {title} debated"
+        forecast = Forecaster(llm, config, news=None, fetcher=None, free_news=headlines).forecast(self.POST)
+        self.assertEqual(forecast.research, {"sources": False, "headlines": True, "news": False, "brief": True})
+        self.assertIn("Will X happen? debated", forecast.comment)
+        self.assertIn("headlines", forecast.comment.split("\n")[0])
 
     def test_reformat_that_still_fails_is_a_failed_run(self):
         llm = self.LLM(["brief", "garbage", "Probability: 40%", "NONE"])
@@ -628,7 +640,7 @@ class FaultInjection(unittest.TestCase):
         self.assertEqual(db.execute("SELECT COUNT(DISTINCT question_id) FROM run").fetchone()[0], 7)
         detail = db.execute("SELECT detail FROM operation WHERE kind='forecast' AND ok=1").fetchone()[0]
         self.assertIn('"research": {"sources": ', detail)
-        self.assertIn('"brief": true', detail)
+        self.assertIn('"headlines": true', detail)  # offline stub; fixtures profile has no brief model
         self.assertIn('"reformatted": 0', detail)
 
     def test_zero_time_budget_stops_cleanly_before_any_question(self):
@@ -755,6 +767,122 @@ class SmokeMode(unittest.TestCase):
         self.assertEqual(self.RecordingFixture.instances[-1].submitted, [])
         self.assertIn("nothing submitted", out)
         self.assertEqual(ops, [])
+
+
+class FreeNews(unittest.TestCase):
+    RSS = ('<?xml version="1.0"?><rss><channel><item><title>Lula leads poll - Reuters</title>'
+           '<pubDate>Mon, 19 Oct 2026 04:30:21 GMT</pubDate></item><item><title>Debate &amp; runoff</title>'
+           '<pubDate>Sun, 18 Oct 2026 10:00:00 GMT</pubDate></item></channel></rss>').encode()
+    SEARCH = json.dumps({"query": {"search": [{"title": "2026 Brazilian general election"}]}}).encode()
+    EXTRACT = json.dumps({"query": {"pages": {"1": {"extract": "General elections were held in Brazil on 4 October 2026."}}}}).encode()
+
+    def test_query_keeps_names_numbers_and_dates(self):
+        self.assertEqual(news_free.query_from_title("Will Brazil's 2026 presidential runoff be won by Lula before Nov 30?"),
+                         "Brazil's 2026 presidential runoff be won by Lula Nov 30")
+
+    def test_headlines_and_background_from_canned_feeds(self):
+        def fetch(url, timeout=15):
+            if "news.google.com" in url:
+                self.assertIn("when%3A14d", url)
+                return self.RSS
+            return self.SEARCH if "list=search" in url else self.EXTRACT
+
+        text = news_free.free_research("Who will win the 2026 Brazilian presidential election?", fetch=fetch)
+        self.assertIn("- Mon, 19 Oct 2026: Lula leads poll - Reuters", text)
+        self.assertIn("Debate & runoff", text)
+        self.assertIn("## Background (Wikipedia: 2026 Brazilian general election)", text)
+        self.assertIn("4 October 2026", text)
+
+    def test_dead_feed_is_reported_not_raised(self):
+        def fetch(url, timeout=15):
+            raise OSError("down")
+
+        self.assertIn("[unavailable: OSError]", news_free.free_research("Will X?", fetch=fetch))
+
+
+class ProviderRouting(unittest.TestCase):
+    def test_split_model(self):
+        self.assertEqual(clients.split_model("groq/openai/gpt-oss-120b"), ("groq", "openai/gpt-oss-120b"))
+        self.assertEqual(clients.split_model("google/gemma-4-31b-it:free"), ("openrouter", "google/gemma-4-31b-it:free"))
+        self.assertEqual(clients.split_model("nvidia/nemotron-3-ultra-550b-a55b:free")[0], "openrouter")
+
+    def test_router_uses_provider_keys_and_endpoints(self):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "or", "GROQ_API_KEY": "gk"}):
+            router = clients.LLMRouter.from_env({})
+        self.assertTrue(router.available("groq/openai/gpt-oss-120b"))
+        self.assertFalse(router.available("cerebras/x"))
+        self.assertTrue(router.available("nvidia/x:free"))
+        ok = {"choices": [{"message": {"content": "Probability: 5%"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        with mock.patch.object(clients, "_request", return_value=ok) as request:
+            completion = router.complete("groq/openai/gpt-oss-120b", "p", max_tokens=100, temperature=0.5,
+                                         reasoning="high", web="native")
+        url, method, headers, body = request.call_args.args[:4]
+        self.assertEqual(url, "https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer gk")
+        self.assertEqual((body["model"], body["max_tokens"], body["temperature"]), ("openai/gpt-oss-120b", 100, 0.5))
+        for field in ("reasoning", "plugins", "usage"):
+            self.assertNotIn(field, body)
+        self.assertEqual(completion.model, "groq/openai/gpt-oss-120b")
+        self.assertEqual(request.call_args.kwargs.get("timeout"), clients.COMPLETION_TIMEOUT)
+
+    def test_daily_cap_error_is_not_retried(self):
+        import email.message
+        error = clients.urllib.error.HTTPError(
+            "https://x", 429, "err", email.message.Message(),
+            io.BytesIO(b'{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits"}}'))
+        with mock.patch("urllib.request.urlopen", side_effect=[error]) as urlopen, mock.patch("time.sleep") as sleep:
+            with self.assertRaises(clients.QuotaExhausted):
+                clients._request("https://x")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+
+class FreeQuota(FaultInjection):
+    FREE_CONFIG = {"profile_chain": ["free"],
+                   "profiles": {"free": {"research_model": None, "models": ["x/a:free", "y/b:free"],
+                                         "runs_per_model": 1, "reformat_model": None}},
+                   "budget": {"free_requests_per_day": 5, "free_requests_reserve": 2},
+                   "tournaments": {"fixtures": {"pace_share": 0.4}}}
+
+    def run_with_config(self, config, *extra, patches=()):
+        path = Path(self.tmp.name) / "cfg.json"
+        path.write_text(json.dumps(config))
+        return self.run_bot(*extra, patches=[(bot, "CONFIG", path), *patches])
+
+    def test_reserve_keeps_free_requests_for_prize_heavy_tournaments(self):
+        code, out, err, db = self.run_with_config(self.FREE_CONFIG)  # 2 calls/question, allowance 5 - 2 = 3
+        self.assertEqual(code, 0)
+        self.assertIn("done=1 failed=0 skipped=6", out)
+        self.assertIn("[quota] 5 question(s) left for later: 2/5", out)  # the 6th skip: a sub-question already forecast
+        self.assertIn('"reason": "free quota"', db.execute("SELECT detail FROM operation WHERE kind='skip'").fetchone()[0])
+        db.close()
+        self.ledger_path.unlink()
+        seasonal = {**self.FREE_CONFIG, "tournaments": {"fixtures": {"pace_share": 1.0}}}
+        code, out, err, db = self.run_with_config(seasonal)  # full allowance 5 → two questions
+        self.assertIn("done=2 failed=0 skipped=5", out)
+
+    def test_quota_exhausted_error_stops_the_run_green(self):
+        def complete(self_, model, prompt, **kwargs):
+            raise RuntimeError("POST x → HTTP 429: Rate limit exceeded: free-models-per-day. Add 10 credits")
+
+        code, out, err, db = self.run_with_config(self.FREE_CONFIG, patches=[(bot.FakeLLM, "complete", complete)])
+        self.assertEqual(code, 0)
+        self.assertIn("stop=free quota exhausted for today", out)
+        self.assertRegex(out, r"done=0 failed=[12] ")
+
+    def test_available_profiles_drops_models_without_keys(self):
+        class LLM:
+            def available(self, model):
+                return not model.startswith("groq/")
+
+        chain = [{"profile": "free", "models": ["a:free", "groq/x"], "research_model": "groq/y", "reformat_model": None},
+                 {"profile": "only-groq", "models": ["groq/z"], "research_model": None, "reformat_model": None}]
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            kept = bot.available_profiles(chain, LLM())
+        self.assertEqual([config["profile"] for config in kept], ["free"])
+        self.assertEqual((kept[0]["models"], kept[0]["research_model"]), (["a:free"], None))
+        self.assertIn("GROQ_API_KEY", out.getvalue())
+        self.assertEqual(bot.free_calls({"models": ["a:free", "groq/x", "b"], "runs_per_model": 2, "research_model": "c:free"}), 3)
 
 
 if __name__ == "__main__":

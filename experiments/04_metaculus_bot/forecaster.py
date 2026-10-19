@@ -22,7 +22,7 @@ from cdf import Scale, percentiles_to_cdf, pool
 from clients import Meter
 from sources import fetch, resolution_sources
 
-NEWS_CHARS, BRIEF_CHARS, SOURCES_CHARS = 8_000, 12_000, 9_000  # caps keep prompts under budget.INPUT_TOKENS_BOUND
+NEWS_CHARS, BRIEF_CHARS, SOURCES_CHARS, HEADLINES_CHARS = 8_000, 12_000, 9_000, 4_000  # caps keep prompts under budget.INPUT_TOKENS_BOUND
 # Metaculus: "Long bot comments that don't add value will be considered spam [...] Private comments are fine within
 # reasonable limits." Ours are private notes; keep them to a few thousand characters: research digest + run endings.
 COMMENT_RESEARCH_CHARS, COMMENT_RUN_CHARS = 1_500, 500
@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
     "research_model": "openai/gpt-5.6-terra",
     "research_web": "native",  # provider search, covered by Metaculus credits (Perplexity is not enabled on them)
     "asknews_articles": 8,
+    "free_news": True,  # Google News headlines + Wikipedia intro, no key, no cost (news_free.py)
     "models": ["openai/gpt-5.6-terra-pro", "anthropic/claude-opus-5.5"],
     "runs_per_model": 3,
     "binary_clamp": [0.015, 0.985],
@@ -39,7 +40,8 @@ DEFAULT_CONFIG = {
     "max_tokens": 12000,  # reasoning tokens count toward it
     "reasoning_effort": None,
     "budget": {"max_usd_per_run": 15.0, "max_usd_per_day": 25.0, "pace_usd_per_day": 6.0, "key_reserve_usd": 0.5,
-               "allow_uncapped_key": False, "season_end": None, "asknews_calls_per_month": 900},
+               "allow_uncapped_key": False, "season_end": None, "asknews_calls_per_month": 900,
+               "free_requests_per_day": 45, "free_requests_reserve": 12},  # OpenRouter free cap (measured ~50/day)
 }
 
 
@@ -69,23 +71,27 @@ Search for the most recent, relevant information. Report concisely:
 4. What markets, experts or official forecasts say (if any).
 Do not give a final probability."""
 
-COMMON = """You are a superforecaster competing in a forecasting tournament scored with proper scoring rules.
+COMMON = """You are a careful superforecaster in a tournament scored with the log score: a confident wrong answer costs
+far more than a hedge gains, yet always hedging toward 50 % loses to calibrated competitors.
 Question: {title}
 Background: {background}
 Resolution criteria: {criteria}
 Fine print: {fine_print}
-Today is {today}. Question closes {close} and resolves {resolve}.
+Today is {today}. The question closes {close} and resolves {resolve}.
 
-Research:
+Research (may be partial; headlines are dated titles only):
 {research}
 
-If resolution sources are given, start from the latest value they show: it is the status quo.
-Think step by step, briefly:
-(a) Time left until resolution; (b) status quo outcome if nothing changes; (c) base rate from comparable cases;
-(d) key evidence that moves you away from the base rate, and by how much;
-(e) one surprise scenario in each direction.
-Remember: the world changes slowly; resolution criteria are applied literally; avoid overconfidence but do not
-hedge toward the middle without reason."""
+Work through, briefly:
+1. What exactly counts, read literally from the resolution criteria, and how much time is left until resolution.
+2. Status quo: what happens if nothing changes. If resolution sources are given, their latest value is the status quo.
+3. Base rate: how often this kind of outcome occurs in this kind of time window.
+4. Dated evidence from the research that moves you away from the base rate, and by how much. Ignore undated or
+   stale items; weigh headlines by date and source.
+5. One surprise scenario in each direction.
+Then commit. The world changes slowly over weeks: "will X happen by <date>" mostly resolves NO when nothing is
+scheduled, but a firm schedule or an already-announced outcome deserves a strong answer. Avoid 0 % and 100 %.
+Keep the visible answer under 400 words."""
 
 BINARY_TAIL = """
 End with exactly one line: "Probability: ZZ%" (0-100, decimals allowed)."""
@@ -240,9 +246,10 @@ def failure_summary(texts: list[str]) -> str:
 
 
 class Forecaster:
-    def __init__(self, llm, config: dict | None = None, news=None, fetcher=fetch):
+    def __init__(self, llm, config: dict | None = None, news=None, fetcher=fetch, free_news=None):
         self.llm, self.news, self.fetcher = llm, news, fetcher
         self.config = {**DEFAULT_CONFIG, **(config or {})}
+        self.free_news = free_news  # callable(title) -> text, or None (tests, offline)
 
     def _complete(self, model: str, prompt: str, meter: Meter, **extra):
         return self.llm.complete(model, prompt, max_tokens=self.config["max_tokens"],
@@ -252,9 +259,11 @@ class Forecaster:
         """Sources, news and brief are independent: fetch them together, keep whatever succeeded.
         Returns the text and {"sources", "news", "brief"} → whether each part made it into the prompt."""
         jobs = {}
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             if self.fetcher:
                 jobs["sources"] = executor.submit(resolution_sources, question, self.fetcher)
+            if self.free_news and self.config.get("free_news", True):
+                jobs["headlines"] = executor.submit(self.free_news, question["title"])
             if self.news:
                 jobs["news"] = executor.submit(self.news.latest, question["title"], self.config["asknews_articles"],
                                                meter)
@@ -264,7 +273,7 @@ class Forecaster:
                     criteria=question.get("resolution_criteria") or "", fine_print=question.get("fine_print") or "")
                 jobs["brief"] = executor.submit(self._complete, self.config["research_model"], prompt, meter,
                                                 web=self.config["research_web"])
-        parts, flags = [], {"sources": False, "news": False, "brief": False}
+        parts, flags = [], {"sources": False, "headlines": False, "news": False, "brief": False}
         for name, future in jobs.items():
             try:
                 result = future.result()
@@ -274,6 +283,9 @@ class Forecaster:
             if name == "sources" and result:
                 parts.append(result[:SOURCES_CHARS])
                 flags["sources"] = True
+            elif name == "headlines" and result:
+                parts.append(result[:HEADLINES_CHARS])
+                flags["headlines"] = True
             elif name == "news" and result:
                 parts.append(f"## Recent news (AskNews)\n{result[:NEWS_CHARS]}")
                 flags["news"] = True
@@ -406,8 +418,8 @@ class Forecaster:
         except EnsembleError as error:
             raise ForecastError(str(error), meter.cost_usd, meter.news_calls, error.runs, flags) from error
 
-        sources = [name for name, used in (("resolution sources", self.fetcher), ("AskNews", self.news),
-                                           (self.config["research_model"], True)) if used and name]
+        sources = [name for name, used in (("resolution sources", self.fetcher), ("headlines", flags["headlines"]),
+                                           ("AskNews", self.news), (self.config["research_model"], True)) if used and name]
         comment = (f"Automated forecast (ensemble of {', '.join(self.config['models'])}, {ok}/{total} runs; "
                    f"research: {', '.join(sources) or 'none'}). Aggregate: {summary}\n\n"
                    f"## Research\n{research[:COMMENT_RESEARCH_CHARS]}\n\n"

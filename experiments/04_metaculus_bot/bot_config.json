@@ -1,8 +1,5 @@
 {
   "profile_chain": [
-    "full",
-    "standard",
-    "cheap",
     "free"
   ],
   "profiles": {
@@ -37,12 +34,19 @@
     },
     "free": {
       "research_model": null,
+      "research_web": null,
       "models": [
-        "google/gemma-4-31b-it:free",
-        "google/gemma-4-26b-a4b-it:free"
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "groq/openai/gpt-oss-120b",
+        "cerebras/qwen-3-235b-a22b-instruct-2507",
+        "gemini/gemini-2.5-flash"
       ],
-      "runs_per_model": 2,
-      "reformat_model": null
+      "runs_per_model": 1,
+      "max_tokens": 8000,
+      "reformat_model": null,
+      "note": "OpenRouter free models measured 2026-10-19 (probe_free.py); the groq/cerebras/gemini entries only run once their key is set (free tiers, ids to verify with the provider's /models)"
     }
   },
   "tournaments": {
@@ -90,7 +94,16 @@
     "key_reserve_usd": 0.5,
     "allow_uncapped_key": false,
     "season_end": "2026-12-20",
-    "asknews_calls_per_month": 900
+    "asknews_calls_per_month": 900,
+    "free_requests_per_day": 45,
+    "free_requests_reserve": 12
   },
-  "reformat_model": "google/gemini-3.8-flash"
+  "reformat_model": "google/gemini-3.8-flash",
+  "profile_chain_with_credits": [
+    "full",
+    "standard",
+    "cheap",
+    "free"
+  ],
+  "free_news": true
 }

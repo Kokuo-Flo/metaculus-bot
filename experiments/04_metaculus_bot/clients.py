@@ -43,6 +43,8 @@ def _request(url: str, method: str = "GET", headers: dict | None = None, body: o
                 return json.loads(payload) if payload else {}
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
+            if error.code == 429 and "free-models-per-day" in detail:  # OpenRouter's daily cap: retrying is useless
+                raise QuotaExhausted(f"{method} {url} → HTTP 429: {detail}") from error
             if error.code == 429 and rate_limited < len(rate_limit_waits):
                 time.sleep(_retry_after(error, rate_limit_waits[rate_limited]))
                 rate_limited += 1
@@ -136,6 +138,10 @@ class FixtureMetaculus:
 
 
 # --- LLM ---
+class QuotaExhausted(RuntimeError):
+    """A provider's free quota for the day is used up: stop taking questions until it resets."""
+
+
 @dataclass
 class KeyStatus:
     limit_usd: float | None  # None = the key can draw on the whole account balance
@@ -179,13 +185,34 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.DOTALL).strip()
 
 
+COMPLETION_TIMEOUT = 600  # free reasoning models take 1-8 min per answer under load (measured 2026-10-19)
+PROVIDERS = {  # OpenAI-compatible endpoints with a card-free free tier (per their docs as of 2026-10; verify before use).
+    # Model ids are written "<provider>/<model>" in bot_config.json; anything else goes to OpenRouter.
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
+    "mistral": ("https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
+    "nim": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY"),
+}
+
+
+def split_model(model: str) -> tuple[str, str]:
+    """'groq/llama-3.3-70b-versatile' → ('groq', 'llama-3.3-70b-versatile'); OpenRouter ids keep their vendor prefix."""
+    prefix, _, rest = model.partition("/")
+    return (prefix, rest) if prefix in PROVIDERS and rest else ("openrouter", model)
+
+
 class OpenRouter:
-    def __init__(self, api_key: str | None = None, catalog: dict[str, dict] | None = None):
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    """Chat completions on OpenRouter, or on any OpenAI-compatible endpoint (`base_url`, `name`)."""
+
+    def __init__(self, api_key: str | None = None, catalog: dict[str, dict] | None = None,
+                 base_url: str = OPENROUTER_API, name: str = "openrouter"):
+        self.api_key = api_key or (os.environ.get("OPENROUTER_API_KEY") if name == "openrouter" else None)
         if not self.api_key:
-            raise RuntimeError("OPENROUTER_API_KEY missing (Metaculus grants free credits to bot makers)")
+            raise RuntimeError("OPENROUTER_API_KEY missing (free models work without credit; Metaculus credits optional)")
         self.headers = {"Authorization": f"Bearer {self.api_key}"}
         self.catalog = catalog or {}
+        self.base_url, self.name = base_url, name
         self.total_cost_usd = 0.0
         self._lock = threading.Lock()  # the ensemble calls complete() from several threads
 
@@ -201,16 +228,18 @@ class OpenRouter:
     def complete(self, model: str, prompt: str, *, max_tokens: int = 8000, temperature: float | None = None,
                  reasoning: str | None = None, web: str | None = None, meter: Meter | None = None) -> Completion:
         """`web="native"`: the provider's own search (covered by Metaculus credits; the Exa engine is not)."""
-        body = {"model": model, "messages": [{"role": "user", "content": prompt}], "usage": {"include": True}}
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
         if self._supported(model, "max_tokens"):
             body["max_tokens"] = max_tokens
         if temperature is not None and self._supported(model, "temperature"):
             body["temperature"] = temperature
-        if reasoning and self._supported(model, "reasoning"):
-            body["reasoning"] = {"effort": reasoning}
-        if web:
-            body["plugins"] = [{"id": "web", "engine": web}]
-        response = _request(f"{OPENROUTER_API}/chat/completions", "POST", self.headers, body)
+        if self.name == "openrouter":  # OpenRouter-only fields; other endpoints may reject unknown keys
+            body["usage"] = {"include": True}
+            if reasoning and self._supported(model, "reasoning"):
+                body["reasoning"] = {"effort": reasoning}
+            if web:
+                body["plugins"] = [{"id": "web", "engine": web}]
+        response = _request(f"{self.base_url}/chat/completions", "POST", self.headers, body, timeout=COMPLETION_TIMEOUT)
         usage = response.get("usage") or {}
         cost = float(usage.get("cost") or 0.0)  # OpenRouter-reported, i.e. measured
         with self._lock:
@@ -223,6 +252,38 @@ class OpenRouter:
             raise RuntimeError(f"{model}: empty answer (finish_reason={choice.get('finish_reason')})")
         return Completion(text, cost, model, int(usage.get("prompt_tokens") or 0),
                           int(usage.get("completion_tokens") or 0))
+
+
+class LLMRouter:
+    """One complete() over several providers: '<provider>/<model>' goes to that provider's client (if its key is
+    set), anything else to OpenRouter. Costs are summed; key_status() is OpenRouter's."""
+
+    def __init__(self, openrouter: OpenRouter, providers: dict[str, OpenRouter] | None = None):
+        self.openrouter, self.providers = openrouter, providers or {}
+
+    @classmethod
+    def from_env(cls, catalog: dict[str, dict] | None = None) -> "LLMRouter":
+        providers = {name: OpenRouter(api_key=os.environ[env], base_url=url, name=name)
+                     for name, (url, env) in PROVIDERS.items() if os.environ.get(env)}
+        return cls(OpenRouter(catalog=catalog), providers)
+
+    @property
+    def total_cost_usd(self) -> float:
+        return self.openrouter.total_cost_usd + sum(client.total_cost_usd for client in self.providers.values())
+
+    def available(self, model: str) -> bool:
+        provider, _ = split_model(model)
+        return provider == "openrouter" or provider in self.providers
+
+    def key_status(self) -> KeyStatus:
+        return self.openrouter.key_status()
+
+    def complete(self, model: str, prompt: str, **kwargs) -> Completion:
+        provider, name = split_model(model)
+        client = self.openrouter if provider == "openrouter" else self.providers[provider]
+        completion = client.complete(name, prompt, **kwargs)
+        completion.model = model  # keep the routed id in transcripts and the ledger
+        return completion
 
 
 # --- News ---
